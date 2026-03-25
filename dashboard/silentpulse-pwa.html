@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Clock">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0a0a0a">
+<title>Clock</title>
+<style>
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none; -webkit-user-select:none; }
+html, body { height:100%; background:#0a0a0a; font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif; color:#fff; overflow:hidden; touch-action:manipulation; }
+
+/* CLOCK */
+#clock-screen { display:flex; flex-direction:column; height:100vh; align-items:center; justify-content:center; gap:8px; }
+.clock-date { font-size:18px; color:#666; font-weight:400; letter-spacing:.5px; }
+#clock-face { display:flex; flex-direction:column; align-items:center; padding:40px; border-radius:50%; }
+.clock-time { font-size:86px; font-weight:200; letter-spacing:-2px; color:#fff; line-height:1; font-variant-numeric:tabular-nums; }
+.clock-secs { font-size:28px; color:#444; font-weight:300; margin-top:4px; }
+.clock-ampm { font-size:18px; color:#333; font-weight:400; letter-spacing:2px; margin-top:8px; }
+
+/* TABS */
+.clock-tabs { position:fixed; bottom:0; left:0; right:0; display:flex; background:#111; border-top:1px solid #1a1a1a; padding-bottom:env(safe-area-inset-bottom); }
+.clock-tab { flex:1; padding:10px 0; display:flex; flex-direction:column; align-items:center; gap:3px; color:#444; font-size:10px; letter-spacing:.3px; cursor:pointer; }
+.clock-tab.active { color:#ff9500; }
+.clock-tab svg { width:22px; height:22px; stroke:currentColor; fill:none; stroke-width:1.5; stroke-linecap:round; stroke-linejoin:round; }
+
+/* ALARM TAB */
+#alarm-screen { display:none; flex-direction:column; height:100vh; background:#0a0a0a; }
+.alarm-header { padding:56px 20px 16px; border-bottom:1px solid #1a1a1a; display:flex; justify-content:space-between; align-items:flex-end; }
+.alarm-title { font-size:28px; font-weight:700; }
+.alarm-add { color:#ff9500; font-size:22px; }
+.alarm-item { padding:16px 20px; border-bottom:1px solid #1a1a1a; display:flex; align-items:center; justify-content:space-between; }
+.alarm-time { font-size:44px; font-weight:200; }
+.alarm-label { font-size:13px; color:#555; margin-top:2px; }
+.toggle { width:48px; height:28px; border-radius:14px; background:#4cd964; position:relative; }
+.toggle::after { content:''; position:absolute; top:2px; right:2px; width:24px; height:24px; border-radius:50%; background:white; }
+.toggle.off { background:#333; }
+.toggle.off::after { right:auto; left:2px; }
+
+/* INVISIBLE */
+#sp-log { position:fixed; top:-999px; left:0; font-size:1px; color:transparent; pointer-events:none; }
+</style>
+</head>
+<body>
+
+<div id="clock-screen">
+  <div class="clock-date" id="clock-date">Saturday, 15 March</div>
+  <div id="clock-face">
+    <div class="clock-time" id="clock-time">12:00</div>
+    <div class="clock-secs" id="clock-secs">00</div>
+    <div class="clock-ampm" id="clock-ampm">AM</div>
+  </div>
+</div>
+
+<div id="alarm-screen">
+  <div class="alarm-header">
+    <div class="alarm-title">Alarms</div>
+    <div class="alarm-add">+</div>
+  </div>
+  <div class="alarm-item">
+    <div><div class="alarm-time">7:30</div><div class="alarm-label">Weekdays</div></div>
+    <div class="toggle"></div>
+  </div>
+  <div class="alarm-item">
+    <div><div class="alarm-time">8:00</div><div class="alarm-label">Weekend</div></div>
+    <div class="toggle off"></div>
+  </div>
+</div>
+
+<div class="clock-tabs">
+  <div class="clock-tab active" onclick="showTab('clock')">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Clock
+  </div>
+  <div class="clock-tab" onclick="showTab('alarm')">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M5 3L2 6M22 6l-3-3M12 9v4l3 2"/><path d="M8 3h8"/></svg>Alarm
+  </div>
+  <div class="clock-tab" onclick="showTab('stopwatch')">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4"/><path d="M9 3h6"/></svg>Stopwatch
+  </div>
+  <div class="clock-tab" onclick="showTab('timer')">
+    <svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="13" r="8"/><path d="M9 3h6"/></svg>Timer
+  </div>
+</div>
+
+<div id="sp-log"></div>
+
+<script>
+const AGENT = 'https://silentpulse-agent-dse6e8c7faffcqg8.uksouth-01.azurewebsites.net/api/agent';
+let busy = false;
+
+// ── CLOCK ──
+function tick() {
+  const now = new Date();
+  let h = now.getHours(), m = now.getMinutes(), s = now.getSeconds();
+  const ap = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  document.getElementById('clock-time').textContent = `${h}:${String(m).padStart(2,'0')}`;
+  document.getElementById('clock-secs').textContent = String(s).padStart(2,'0');
+  document.getElementById('clock-ampm').textContent = ap;
+  const days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  document.getElementById('clock-date').textContent = `${days[now.getDay()]}, ${now.getDate()} ${months[now.getMonth()]}`;
+}
+setInterval(tick, 1000); tick();
+
+// ── TABS ──
+function showTab(t) {
+  document.getElementById('clock-screen').style.display = t==='clock' ? 'flex' : 'none';
+  document.getElementById('alarm-screen').style.display = t==='alarm' ? 'flex' : 'none';
+  document.querySelectorAll('.clock-tab').forEach((el,i) => el.classList.toggle('active', ['clock','alarm','stopwatch','timer'][i]===t));
+}
+
+// ── GESTURE: TAP TAP HOLD ──
+// Two taps within 600ms each, then finger held for 1000ms → trigger
+let taps = [];
+let holdTimer = null;
+
+function gestureStart() {
+  const now = Date.now();
+  taps.push(now);
+  if (taps.length > 3) taps.shift();
+
+  const len = taps.length;
+  if (len >= 2 && (taps[len-1] - taps[len-2]) < 600) {
+    // Two quick taps — start hold countdown
+    clearTimeout(holdTimer);
+    holdTimer = setTimeout(() => {
+      taps = [];
+      holdTimer = null;
+      triggerSOS();
+    }, 1000);
+  }
+}
+
+function gestureEnd() {
+  // Finger lifted — cancel hold if not yet fired
+  // But only cancel if we haven't hit the threshold
+  // We let the timer run — if they held 1s it already fired
+}
+
+function gestureCancel() {
+  clearTimeout(holdTimer);
+  holdTimer = null;
+}
+
+// Attach to entire clock screen — anywhere they touch
+const cs = document.getElementById('clock-screen');
+cs.addEventListener('touchstart', gestureStart, { passive: true });
+cs.addEventListener('touchend',   gestureEnd,   { passive: true });
+cs.addEventListener('touchcancel',gestureCancel,{ passive: true });
+
+// ── SOS TRIGGER ──
+async function triggerSOS() {
+  if (busy) return;
+  busy = true;
+
+  const log = document.getElementById('sp-log');
+  const ts  = new Date().toISOString();
+
+  // ── STEP 1: GPS ──
+  let lat = '', lng = '', mapsUrl = '';
+  try {
+    const pos = await new Promise((res, rej) =>
+      navigator.geolocation.getCurrentPosition(res, rej, {
+        enableHighAccuracy: true, timeout: 8000, maximumAge: 0
+      })
+    );
+    lat      = pos.coords.latitude.toFixed(7);
+    lng      = pos.coords.longitude.toFixed(7);
+    mapsUrl  = `https://maps.google.com/?q=${lat},${lng}`;
+    log.textContent = 'gps-ok';
+  } catch(e) { log.textContent = 'gps-fail'; }
+
+  // ── STEP 2: Capture single photo ──
+  let photoB64 = '';
+  let videoStream = null;
+
+  try {
+    videoStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: true
+    });
+
+    // Grab one frame as JPEG
+    const video = document.createElement('video');
+    video.srcObject = videoStream;
+    video.muted = true;
+    video.setAttribute('playsinline', '');
+    await video.play();
+    await new Promise(r => setTimeout(r, 800)); // let camera settle
+
+    const canvas = document.createElement('canvas');
+    canvas.width  = 640;
+    canvas.height = 480;
+    canvas.getContext('2d').drawImage(video, 0, 0, 640, 480);
+    photoB64 = canvas.toDataURL('image/jpeg', 0.75).split(',')[1];
+    log.textContent = 'photo-ok';
+  } catch(e) {
+    log.textContent = 'cam-fail';
+    // Try audio-only stream for the video part
+    try {
+      videoStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch(e2) { videoStream = null; }
+  }
+
+  // ── SEND MESSAGE 1: GPS + Photo ──
+  fetch(AGENT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name:               'SOS Alert',
+      phone:              '',
+      timestamp:          ts,
+      lat,
+      lng,
+      maps_url:           mapsUrl,
+      attachment_content: photoB64,
+      attachment_name:    photoB64 ? 'sos_photo.jpg' : ''
+    })
+  }).catch(() => {});
+  log.textContent = 'msg1-sent';
+
+  // ── STEP 3: Record 25 seconds video+audio ──
+  if (videoStream) {
+    const mimeType = [
+      'video/webm;codecs=vp8,opus',
+      'video/webm;codecs=vp9,opus',
+      'video/webm',
+      'audio/webm;codecs=opus',
+      'audio/webm',
+    ].find(t => MediaRecorder.isTypeSupported(t)) || '';
+
+    const recorder = new MediaRecorder(videoStream, mimeType ? { mimeType } : {});
+    const chunks   = [];
+
+    recorder.ondataavailable = e => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+
+    recorder.onstop = () => {
+      videoStream.getTracks().forEach(t => t.stop());
+      const ext  = mimeType.includes('mp4') ? 'mp4' : 'webm';
+      const blob = new Blob(chunks, { type: mimeType || 'video/webm' });
+
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const b64 = reader.result.split(',')[1];
+        // ── SEND MESSAGE 2: 25s video ──
+        fetch(AGENT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name:               'SOS Video',
+            phone:              '',
+            timestamp:          ts,
+            lat,
+            lng,
+            maps_url:           mapsUrl,
+            attachment_content: b64,
+            attachment_name:    `sos_video.${ext}`
+          })
+        }).catch(() => {});
+        log.textContent = 'msg2-sent';
+        busy = false;
+      };
+      reader.readAsDataURL(blob);
+    };
+
+    recorder.start();
+    log.textContent = 'recording';
+
+    // Stop at 25 seconds
+    setTimeout(() => {
+      if (recorder.state !== 'inactive') recorder.stop();
+    }, 25000);
+
+  } else {
+    busy = false;
+  }
+}
+
+// ── PWA SERVICE WORKER ──
+if ('serviceWorker' in navigator) {
+  const sw = `
+    self.addEventListener('install', () => self.skipWaiting());
+    self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+    self.addEventListener('fetch', e => e.respondWith(fetch(e.request).catch(() => new Response(''))));
+  `;
+  const blob   = new Blob([sw], { type: 'application/javascript' });
+  const swUrl  = URL.createObjectURL(blob);
+  navigator.serviceWorker.register(swUrl).catch(() => {});
+}
+
+// ── PWA MANIFEST ──
+const manifest = {
+  name: 'Clock',
+  short_name: 'Clock',
+  description: 'World clock and alarm',
+  start_url: '.',
+  display: 'standalone',
+  background_color: '#0a0a0a',
+  theme_color: '#0a0a0a',
+  orientation: 'portrait',
+  icons: [{
+    src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'%3E%3Crect width='96' height='96' rx='20' fill='%230a0a0a'/%3E%3Ccircle cx='48' cy='52' r='28' stroke='%23444' stroke-width='2.5' fill='none'/%3E%3Cline x1='48' y1='52' x2='48' y2='32' stroke='white' stroke-width='2.5' stroke-linecap='round'/%3E%3Cline x1='48' y1='52' x2='64' y2='61' stroke='%23ff9500' stroke-width='2' stroke-linecap='round'/%3E%3Ccircle cx='48' cy='52' r='2.5' fill='white'/%3E%3C/svg%3E",
+    sizes: 'any',
+    type: 'image/svg+xml',
+    purpose: 'any maskable'
+  }]
+};
+const ml = document.createElement('link');
+ml.rel  = 'manifest';
+ml.href = 'data:application/manifest+json,' + encodeURIComponent(JSON.stringify(manifest));
+document.head.appendChild(ml);
+</script>
+</body>
+</html>

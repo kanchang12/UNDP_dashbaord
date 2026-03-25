@@ -1,0 +1,927 @@
+# MIT Licence — CrisisMap, UNDP Crisis Damage Reporting
+# Azure Functions backend. All environment variables must be configured in
+# Application Settings — never hardcoded.
+#
+# Required env vars:
+#   SUPABASE_URL        — e.g. https://xxxx.supabase.co
+#   SUPABASE_ANON_KEY   — Supabase anon/service_role key
+#   GEMINI_API_KEY      — Google Gemini API key (image analysis + fallback)
+#   OPENAI_API_KEY      — OpenAI API key (combined assessment, Step 3)
+#
+# Database schema (run once in Supabase SQL editor):
+# See bottom of this file.
+
+import azure.functions as func
+import base64
+import io
+import json
+import logging
+import math
+import os
+import uuid
+from datetime import datetime, timezone, timedelta
+
+import requests
+
+app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+
+# ── Environment variables ──────────────────────────────────────────────────────
+
+SUPABASE_URL      = os.environ.get("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
+OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
+
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/"
+    "models/gemini-1.5-flash:generateContent"
+)
+STORAGE_BUCKET = "report-images"
+
+# ── CORS headers ───────────────────────────────────────────────────────────────
+
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+}
+
+def cors_response(body: str, status: int = 200, mimetype: str = "application/json") -> func.HttpResponse:
+    return func.HttpResponse(body, status_code=status, mimetype=mimetype, headers=CORS_HEADERS)
+
+
+# ── Supabase REST helpers ──────────────────────────────────────────────────────
+
+def _sb_headers(content_type: str = "application/json") -> dict:
+    return {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": content_type,
+        "Prefer": "return=representation",
+    }
+
+
+def sb_insert(table: str, data: dict) -> dict | None:
+    """Insert a row and return the inserted record."""
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_sb_headers(),
+            json=data,
+            timeout=10,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else data
+    except Exception as e:
+        logging.error(f"sb_insert {table}: {e}")
+        return None
+
+
+def sb_select(table: str, params: dict | None = None, single: bool = False) -> list | dict | None:
+    """Select rows with optional PostgREST filter params."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers={**_sb_headers(), "Accept": "application/json"},
+            params=params or {},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data[0] if single and data else data
+    except Exception as e:
+        logging.error(f"sb_select {table}: {e}")
+        return None if single else []
+
+
+def sb_update(table: str, match: dict, data: dict) -> None:
+    """Update rows matching the given equality filters."""
+    try:
+        params = {k: f"eq.{v}" for k, v in match.items()}
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_sb_headers(),
+            params=params,
+            json=data,
+            timeout=10,
+        )
+    except Exception as e:
+        logging.error(f"sb_update {table}: {e}")
+
+
+# ── Supabase Storage ───────────────────────────────────────────────────────────
+
+def upload_image_to_storage(image_b64: str, report_id: str, index: int) -> str | None:
+    """Upload a base64-encoded image to Supabase Storage and return the public URL."""
+    try:
+        image_bytes = base64.b64decode(image_b64)
+        filename = f"{report_id}/{index}.jpg"
+        r = requests.post(
+            f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{filename}",
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                "Content-Type": "image/jpeg",
+            },
+            data=image_bytes,
+            timeout=20,
+        )
+        if r.status_code in (200, 201):
+            return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{filename}"
+        logging.warning(f"Storage upload {index}: {r.status_code} {r.text[:120]}")
+        return None
+    except Exception as e:
+        logging.error(f"upload_image_to_storage: {e}")
+        return None
+
+
+# ── Haversine distance (metres) ────────────────────────────────────────────────
+
+def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    R = 6_371_000
+    φ1, φ2 = math.radians(lat1), math.radians(lat2)
+    Δφ = math.radians(lat2 - lat1)
+    Δλ = math.radians(lng2 - lng1)
+    a = math.sin(Δφ / 2) ** 2 + math.cos(φ1) * math.cos(φ2) * math.sin(Δλ / 2) ** 2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# ── AI Pipeline ────────────────────────────────────────────────────────────────
+
+def _gemini_post(payload: dict, timeout: int = 20) -> dict | None:
+    """POST to Gemini REST endpoint."""
+    try:
+        r = requests.post(
+            GEMINI_URL,
+            params={"key": GEMINI_API_KEY},
+            json=payload,
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logging.error(f"Gemini call failed: {e}")
+        return None
+
+
+def _extract_json_from_gemini(response: dict) -> dict | None:
+    """Pull the first JSON object out of a Gemini text response."""
+    try:
+        text = response["candidates"][0]["content"]["parts"][0]["text"]
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(text[start:end])
+    except Exception as e:
+        logging.warning(f"JSON extraction failed: {e}")
+    return None
+
+
+def step1_image_analysis(image_b64_list: list[str]) -> dict:
+    """
+    Step 1 — Gemini Vision API.
+    Analyses all submitted images together and returns a structured
+    damage assessment.
+    """
+    if not GEMINI_API_KEY or not image_b64_list:
+        return {
+            "damage_level": "unknown",
+            "infrastructure_type": "unknown",
+            "debris_detected": False,
+            "confidence": 0.0,
+            "reasoning": "Image analysis unavailable — no API key or images.",
+        }
+
+    parts = [
+        {
+            "text": (
+                "Analyse these images of infrastructure damage. "
+                "Classify damage as exactly one of: minimal, partial, or complete. "
+                "Identify the infrastructure type visible. "
+                "Detect any debris present. "
+                "Provide a confidence score 0-1. "
+                "Return JSON only, no markdown: "
+                '{"damage_level": "minimal|partial|complete", '
+                '"infrastructure_type": "residential|commercial|government|utility|transport|community|public|other", '
+                '"debris_detected": true|false, '
+                '"confidence": 0.0-1.0, '
+                '"reasoning": "one sentence"}'
+            )
+        }
+    ]
+
+    # Attach up to 4 images as inline data.
+    for b64 in image_b64_list[:4]:
+        parts.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": b64,
+            }
+        })
+
+    payload = {"contents": [{"parts": parts}]}
+    response = _gemini_post(payload, timeout=30)
+    if response:
+        result = _extract_json_from_gemini(response)
+        if result:
+            return result
+
+    return {
+        "damage_level": "unknown",
+        "infrastructure_type": "unknown",
+        "debris_detected": False,
+        "confidence": 0.0,
+        "reasoning": "Gemini Vision analysis returned no parseable result.",
+    }
+
+
+def step2_area_signals(lat: float | None, lng: float | None) -> dict:
+    """
+    Step 2 — Area signal aggregation.
+    Queries all reports within 500m submitted in the last 2 hours.
+    """
+    if lat is None or lng is None:
+        return {"nearby_count": 0, "avg_damage": None, "dominant_crisis": None}
+
+    two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    # Bounding box approximation for the initial DB query.
+    lat_delta = 0.0045  # ~500m
+    lng_delta = lat_delta / max(math.cos(math.radians(lat)), 0.01)
+
+    rows = sb_select("reports", params={
+        "lat": f"gte.{lat - lat_delta}",
+        "lng": f"gte.{lng - lng_delta}",
+        "submitted_at": f"gte.{two_hours_ago}",
+        "select": "lat,lng,damage_level,crisis_type",
+        "limit": "200",
+    }) or []
+
+    # Filter precisely by haversine distance.
+    nearby = [
+        r for r in rows
+        if r.get("lat") and r.get("lng")
+        and haversine_m(lat, lng, float(r["lat"]), float(r["lng"])) <= 500
+    ]
+
+    if not nearby:
+        return {"nearby_count": 0, "avg_damage": None, "dominant_crisis": None}
+
+    damage_scores = {"minimal": 1, "partial": 2, "complete": 3}
+    levels = [damage_scores.get(r.get("damage_level", ""), 0) for r in nearby if r.get("damage_level")]
+    avg_score = sum(levels) / len(levels) if levels else 0
+
+    crisis_counts: dict[str, int] = {}
+    for r in nearby:
+        ct = r.get("crisis_type", "")
+        if ct:
+            crisis_counts[ct] = crisis_counts.get(ct, 0) + 1
+    dominant = max(crisis_counts, key=crisis_counts.get) if crisis_counts else None
+
+    avg_damage = (
+        "minimal" if avg_score < 1.5
+        else "partial" if avg_score < 2.5
+        else "complete"
+    )
+
+    return {
+        "nearby_count": len(nearby),
+        "avg_damage": avg_damage,
+        "dominant_crisis": dominant,
+        "density_per_km2": round(len(nearby) / (math.pi * 0.5 ** 2), 1),
+    }
+
+
+def step3_combined_assessment(
+    image_analysis: dict,
+    area_signals: dict,
+    form_data: dict,
+) -> dict:
+    """
+    Step 3 — Combined AI decision.
+    Sends image analysis + area signals + form data to OpenAI GPT-4o,
+    with Gemini as fallback, and returns a final prioritised assessment.
+    """
+    system_prompt = (
+        "You are a UNDP crisis assessment AI. "
+        "Given image analysis results and surrounding area signals, "
+        "make a final damage assessment and priority score for emergency responders. "
+        "Be objective and data-driven. Return JSON only, no markdown."
+    )
+    user_content = (
+        f"Image analysis: {json.dumps(image_analysis)}\n"
+        f"Area signals (500m radius, last 2h): {json.dumps(area_signals)}\n"
+        f"Reported infrastructure type: {form_data.get('infrastructure_type', 'unknown')}\n"
+        f"Reported damage level: {form_data.get('damage_level', 'unknown')}\n"
+        f"Crisis type: {form_data.get('crisis_type', 'unknown')}\n"
+        f"Debris reported: {form_data.get('has_debris', 'unknown')}\n"
+        f"Pressing needs: {form_data.get('pressing_needs', [])}\n\n"
+        "Return JSON: "
+        '{"final_damage_level": "minimal|partial|complete", '
+        '"priority_score": 0-100, '
+        '"confidence": 0.0-1.0, '
+        '"recommended_action": "one sentence action for responders", '
+        '"reasoning": "two sentences max"}'
+    )
+
+    # OpenAI GPT-4o (primary).
+    if OPENAI_API_KEY:
+        try:
+            r = requests.post(
+                OPENAI_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "max_tokens": 300,
+                    "temperature": 0.1,
+                },
+                timeout=20,
+            )
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"]
+            start, end = text.find("{"), text.rfind("}") + 1
+            if start >= 0 and end > start:
+                return json.loads(text[start:end])
+        except Exception as e:
+            logging.warning(f"OpenAI step3 failed, falling back to Gemini: {e}")
+
+    # Gemini fallback.
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": f"System: {system_prompt}\n\nUser: {user_content}"}
+            ]
+        }]
+    }
+    response = _gemini_post(payload, timeout=20)
+    if response:
+        result = _extract_json_from_gemini(response)
+        if result:
+            return result
+
+    # Hard fallback — use reported data + image analysis as ground truth.
+    reported = form_data.get("damage_level", "unknown")
+    ai_damage = image_analysis.get("damage_level", reported)
+    final = ai_damage if ai_damage != "unknown" else reported
+    priority = {"minimal": 20, "partial": 55, "complete": 85}.get(final, 30)
+
+    return {
+        "final_damage_level": final,
+        "priority_score": priority,
+        "confidence": image_analysis.get("confidence", 0.3),
+        "recommended_action": "Dispatch assessment team to verify damage.",
+        "reasoning": "Automated assessment unavailable; using reported values.",
+    }
+
+
+def step4_duplicate_detection(
+    building_footprint_id: str | None,
+    device_id: str,
+    report_id: str,
+) -> tuple[bool, str | None]:
+    """
+    Step 4 — Duplicate detection.
+    Returns (is_duplicate_flagged, version_group_id).
+    """
+    if not building_footprint_id:
+        return False, None
+
+    existing = sb_select("reports", params={
+        "building_footprint_id": f"eq.{building_footprint_id}",
+        "id": f"neq.{report_id}",
+        "select": "id,version_group_id,anonymous_device_id,submitted_at",
+        "order": "submitted_at.desc",
+        "limit": "10",
+    }) or []
+
+    if not existing:
+        return False, None
+
+    # Use existing version group or create one.
+    version_group_id = None
+    for row in existing:
+        if row.get("version_group_id"):
+            version_group_id = row["version_group_id"]
+            break
+    if not version_group_id:
+        version_group_id = str(uuid.uuid4())
+
+    # Flag as duplicate if same device submitted within 10 minutes.
+    is_flagged = False
+    ten_min_ago = datetime.now(timezone.utc) - timedelta(minutes=10)
+    for row in existing:
+        if row.get("anonymous_device_id") == device_id:
+            try:
+                ts = datetime.fromisoformat(row["submitted_at"].replace("Z", "+00:00"))
+                if ts > ten_min_ago:
+                    is_flagged = True
+                    break
+            except Exception:
+                pass
+
+    return is_flagged, version_group_id
+
+
+# ── Area signal score ──────────────────────────────────────────────────────────
+
+def compute_area_signal_score(area_signals: dict, combined: dict) -> float:
+    """
+    Derive a 0-1 normalised area urgency score from the area signals
+    and combined AI assessment.
+    """
+    score = combined.get("priority_score", 30) / 100
+    density_boost = min(area_signals.get("density_per_km2", 0) / 20, 0.3)
+    return round(min(score + density_boost, 1.0), 3)
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@app.route(route="submit-report", methods=["POST", "OPTIONS"])
+def submit_report(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    POST /api/submit-report
+    Accepts: form data (all UNDP fields) + optional base64 images
+    Returns: submission_id, ai_classification, priority_score
+    """
+    if req.method == "OPTIONS":
+        return cors_response("", 204)
+
+    logging.info("submit-report called")
+    try:
+        body = req.get_json()
+    except Exception:
+        return cors_response(json.dumps({"error": "Invalid JSON"}), 400)
+
+    # ── Validate required fields ───────────────────────────────────────────────
+    required = ["infrastructure_type", "damage_level", "crisis_type",
+                "has_debris", "electricity_status", "health_services_status",
+                "pressing_needs", "anonymous_device_id"]
+    missing = [f for f in required if not body.get(f)]
+    if missing:
+        return cors_response(
+            json.dumps({"error": f"Missing required fields: {missing}"}), 400
+        )
+
+    report_id = str(uuid.uuid4())
+    submitted_at = body.get("submitted_at") or datetime.now(timezone.utc).isoformat()
+    lat = body.get("lat")
+    lng = body.get("lng")
+    device_id = body.get("anonymous_device_id", "")
+
+    # ── Upload images to Supabase Storage ──────────────────────────────────────
+    images_b64: list[str] = body.get("images_b64", [])
+    image_urls: list[str] = []
+    for i, b64 in enumerate(images_b64[:4]):
+        url = upload_image_to_storage(b64, report_id, i)
+        if url:
+            image_urls.append(url)
+
+    # If client sent pre-uploaded URLs, use those.
+    if not image_urls:
+        image_urls = body.get("image_urls", [])
+
+    # ── AI Pipeline ────────────────────────────────────────────────────────────
+    image_analysis = step1_image_analysis(images_b64[:4] if images_b64 else [])
+    area_signals   = step2_area_signals(
+        float(lat) if lat is not None else None,
+        float(lng) if lng is not None else None,
+    )
+    combined       = step3_combined_assessment(image_analysis, area_signals, body)
+    is_dup, vg_id  = step4_duplicate_detection(
+        body.get("building_footprint_id"), device_id, report_id
+    )
+    area_score     = compute_area_signal_score(area_signals, combined)
+
+    # ── Persist to Supabase ────────────────────────────────────────────────────
+    pressing_needs = body.get("pressing_needs", [])
+    if isinstance(pressing_needs, str):
+        pressing_needs = [pressing_needs]
+
+    record = {
+        "id": report_id,
+        "submitted_at": submitted_at,
+        "lat": float(lat) if lat is not None else None,
+        "lng": float(lng) if lng is not None else None,
+        "building_footprint_id": body.get("building_footprint_id"),
+        "location_description": body.get("location_description"),
+        "infrastructure_type": body.get("infrastructure_type"),
+        "infrastructure_type_other": body.get("infrastructure_type_other"),
+        "infrastructure_name": body.get("infrastructure_name"),
+        "damage_level": body.get("damage_level"),
+        "crisis_type": body.get("crisis_type"),
+        "has_debris": body.get("has_debris"),
+        "electricity_status": body.get("electricity_status"),
+        "health_services_status": body.get("health_services_status"),
+        "pressing_needs": pressing_needs,
+        "image_urls": image_urls,
+        "ai_damage_classification": combined.get("final_damage_level"),
+        "ai_confidence_score": combined.get("confidence"),
+        "ai_reasoning": combined.get("reasoning"),
+        "ai_recommended_action": combined.get("recommended_action"),
+        "ai_priority_score": combined.get("priority_score"),
+        "area_signal_score": area_score,
+        "is_duplicate_flagged": is_dup,
+        "version_group_id": vg_id,
+        "language_submitted": body.get("language_submitted", "en"),
+        "anonymous_device_id": device_id,
+    }
+
+    inserted = sb_insert("reports", record)
+
+    # If this report is part of a version group, update older entries with the group id.
+    if vg_id and not is_dup:
+        sb_update(
+            "reports",
+            {"building_footprint_id": body.get("building_footprint_id", "")},
+            {"version_group_id": vg_id},
+        )
+
+    return cors_response(json.dumps({
+        "submission_id": report_id,
+        "ai_classification": combined.get("final_damage_level"),
+        "ai_priority_score": combined.get("priority_score"),
+        "ai_reasoning": combined.get("reasoning"),
+        "ai_recommended_action": combined.get("recommended_action"),
+        "area_signals": area_signals,
+        "is_duplicate_flagged": is_dup,
+        "image_urls": image_urls,
+    }), 201)
+
+
+@app.route(route="reports", methods=["GET", "OPTIONS"])
+def get_reports(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    GET /api/reports
+    Returns all reports as GeoJSON with optional filters.
+    Query params: crisis_type, damage_level, infrastructure_type,
+                  date_from, date_to, bbox (minlng,minlat,maxlng,maxlat),
+                  format (geojson|csv)
+    """
+    if req.method == "OPTIONS":
+        return cors_response("", 204)
+
+    params: dict = {}
+    p = req.params
+
+    if p.get("crisis_type"):
+        params["crisis_type"] = f"eq.{p['crisis_type']}"
+    if p.get("damage_level"):
+        params["damage_level"] = f"eq.{p['damage_level']}"
+    if p.get("infrastructure_type"):
+        params["infrastructure_type"] = f"eq.{p['infrastructure_type']}"
+    if p.get("date_from"):
+        params["submitted_at"] = f"gte.{p['date_from']}"
+    if p.get("date_to"):
+        params["submitted_at"] = f"lte.{p['date_to']}"
+
+    params["order"] = "submitted_at.desc"
+    params["limit"] = "2000"
+
+    rows = sb_select("reports", params=params) or []
+
+    # Bounding box filter applied in Python (PostgREST range filters are not
+    # trivially composable for lat/lng pairs).
+    bbox = p.get("bbox")
+    if bbox:
+        try:
+            min_lng, min_lat, max_lng, max_lat = map(float, bbox.split(","))
+            rows = [
+                r for r in rows
+                if r.get("lat") and r.get("lng")
+                and min_lat <= float(r["lat"]) <= max_lat
+                and min_lng <= float(r["lng"]) <= max_lng
+            ]
+        except Exception:
+            pass
+
+    fmt = p.get("format", "geojson")
+    if fmt == "csv":
+        return _rows_to_csv_response(rows)
+
+    geojson = _rows_to_geojson(rows)
+    return cors_response(json.dumps(geojson))
+
+
+@app.route(route="dashboard-stats", methods=["GET", "OPTIONS"])
+def dashboard_stats(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    GET /api/dashboard-stats
+    Returns aggregate statistics for the dashboard analytics panel.
+    """
+    if req.method == "OPTIONS":
+        return cors_response("", 204)
+
+    rows = sb_select("reports", params={"order": "submitted_at.desc", "limit": "5000"}) or []
+
+    total = len(rows)
+
+    # Breakdown counts
+    damage_counts = _count_by(rows, "damage_level")
+    infra_counts  = _count_by(rows, "infrastructure_type")
+    crisis_counts = _count_by(rows, "crisis_type")
+
+    # Timeline: last 24hrs in 1-hour buckets
+    now = datetime.now(timezone.utc)
+    buckets: dict[str, int] = {}
+    for h in range(24):
+        label = (now - timedelta(hours=23 - h)).strftime("%H:00")
+        buckets[label] = 0
+    for r in rows:
+        ts_str = r.get("submitted_at", "")
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if ts >= now - timedelta(hours=24):
+                label = ts.strftime("%H:00")
+                if label in buckets:
+                    buckets[label] += 1
+        except Exception:
+            pass
+
+    # Heatmap points: [lat, lng, intensity] — intensity mapped from damage level
+    intensity_map = {"minimal": 0.3, "partial": 0.6, "complete": 1.0}
+    heatmap = [
+        [float(r["lat"]), float(r["lng"]), intensity_map.get(r.get("damage_level", ""), 0.5)]
+        for r in rows
+        if r.get("lat") and r.get("lng")
+    ]
+
+    # Priority queue: top 10 by AI priority score
+    priority_rows = sorted(
+        [r for r in rows if r.get("ai_priority_score") is not None],
+        key=lambda r: float(r["ai_priority_score"]),
+        reverse=True,
+    )[:10]
+    priority_queue = [
+        {
+            "id": r.get("id"),
+            "lat": r.get("lat"),
+            "lng": r.get("lng"),
+            "infrastructure_type": r.get("infrastructure_type"),
+            "damage_level": r.get("damage_level"),
+            "ai_priority_score": r.get("ai_priority_score"),
+            "ai_recommended_action": r.get("ai_recommended_action"),
+            "submitted_at": r.get("submitted_at"),
+        }
+        for r in priority_rows
+    ]
+
+    return cors_response(json.dumps({
+        "total": total,
+        "damage_counts": damage_counts,
+        "infra_counts": infra_counts,
+        "crisis_counts": crisis_counts,
+        "timeline_24h": [{"hour": k, "count": v} for k, v in buckets.items()],
+        "heatmap_points": heatmap,
+        "priority_queue": priority_queue,
+        "last_updated": now.isoformat(),
+    }))
+
+
+@app.route(route="export", methods=["POST", "OPTIONS"])
+def export_data(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    POST /api/export
+    Body: { filters: {...}, format: "csv"|"geojson" }
+    Returns filtered data as downloadable CSV or GeoJSON.
+    """
+    if req.method == "OPTIONS":
+        return cors_response("", 204)
+
+    try:
+        body = req.get_json()
+    except Exception:
+        body = {}
+
+    filters = body.get("filters", {})
+    fmt = body.get("format", "csv")
+
+    params: dict = {"order": "submitted_at.desc", "limit": "10000"}
+    if filters.get("crisis_type"):
+        params["crisis_type"] = f"eq.{filters['crisis_type']}"
+    if filters.get("damage_level"):
+        params["damage_level"] = f"eq.{filters['damage_level']}"
+    if filters.get("infrastructure_type"):
+        params["infrastructure_type"] = f"eq.{filters['infrastructure_type']}"
+    if filters.get("date_from"):
+        params["submitted_at"] = f"gte.{filters['date_from']}"
+    if filters.get("date_to"):
+        params["submitted_at"] = f"lte.{filters['date_to']}"
+
+    rows = sb_select("reports", params=params) or []
+
+    if fmt == "geojson":
+        content = json.dumps(_rows_to_geojson(rows), indent=2)
+        return func.HttpResponse(
+            content,
+            status_code=200,
+            mimetype="application/geo+json",
+            headers={
+                **CORS_HEADERS,
+                "Content-Disposition": "attachment; filename=crisismap_export.geojson",
+            },
+        )
+
+    return _rows_to_csv_response(rows)
+
+
+@app.route(route="reporter-alert", methods=["POST", "OPTIONS"])
+def reporter_alert(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    POST /api/reporter-alert
+    Receives a silent reporter safety alert from the Flutter app.
+    Stores to a dedicated 'reporter_alerts' table for the assigned coordinator.
+    No PII is stored — only anonymous_device_id, GPS, and timestamp.
+    """
+    if req.method == "OPTIONS":
+        return cors_response("", 204)
+
+    try:
+        body = req.get_json()
+    except Exception:
+        return cors_response(json.dumps({"error": "Invalid JSON"}), 400)
+
+    record = {
+        "id": str(uuid.uuid4()),
+        "alert_type": body.get("alert_type", "REPORTER_SAFETY_ALERT"),
+        "anonymous_device_id": body.get("anonymous_device_id", "unknown"),
+        "coordinator_id": body.get("coordinator_id", ""),
+        "lat": body.get("lat"),
+        "lng": body.get("lng"),
+        "accuracy_metres": body.get("accuracy_metres"),
+        "triggered_at": body.get("triggered_at") or datetime.now(timezone.utc).isoformat(),
+    }
+
+    sb_insert("reporter_alerts", record)
+    logging.info(f"Reporter safety alert from {record['anonymous_device_id']} to coordinator {record['coordinator_id']}")
+
+    return cors_response(json.dumps({"status": "received"}), 201)
+
+
+# ── Serialisation helpers ──────────────────────────────────────────────────────
+
+def _rows_to_geojson(rows: list) -> dict:
+    """Convert report rows to valid GeoJSON FeatureCollection."""
+    features = []
+    for r in rows:
+        if not r.get("lat") or not r.get("lng"):
+            continue
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [float(r["lng"]), float(r["lat"])],
+            },
+            "properties": {
+                "id": r.get("id"),
+                "submitted_at": r.get("submitted_at"),
+                "infrastructure_type": r.get("infrastructure_type"),
+                "infrastructure_name": r.get("infrastructure_name"),
+                "damage_level": r.get("damage_level"),
+                "crisis_type": r.get("crisis_type"),
+                "has_debris": r.get("has_debris"),
+                "electricity_status": r.get("electricity_status"),
+                "health_services_status": r.get("health_services_status"),
+                "pressing_needs": r.get("pressing_needs", []),
+                "location_description": r.get("location_description"),
+                "building_footprint_id": r.get("building_footprint_id"),
+                "image_urls": r.get("image_urls", []),
+                "ai_damage_classification": r.get("ai_damage_classification"),
+                "ai_confidence_score": r.get("ai_confidence_score"),
+                "ai_reasoning": r.get("ai_reasoning"),
+                "ai_recommended_action": r.get("ai_recommended_action"),
+                "ai_priority_score": r.get("ai_priority_score"),
+                "area_signal_score": r.get("area_signal_score"),
+                "is_duplicate_flagged": r.get("is_duplicate_flagged"),
+                "version_group_id": r.get("version_group_id"),
+                "language_submitted": r.get("language_submitted"),
+            },
+        })
+    return {"type": "FeatureCollection", "features": features}
+
+
+_CSV_FIELDS = [
+    "id", "submitted_at", "lat", "lng", "building_footprint_id",
+    "location_description", "infrastructure_type", "infrastructure_type_other",
+    "infrastructure_name", "damage_level", "crisis_type", "has_debris",
+    "electricity_status", "health_services_status", "pressing_needs",
+    "image_urls", "ai_damage_classification", "ai_confidence_score",
+    "ai_reasoning", "ai_recommended_action", "ai_priority_score",
+    "area_signal_score", "is_duplicate_flagged", "version_group_id",
+    "language_submitted", "anonymous_device_id",
+]
+
+
+def _rows_to_csv_response(rows: list) -> func.HttpResponse:
+    lines = [",".join(_CSV_FIELDS)]
+    for r in rows:
+        def _cell(v):
+            if isinstance(v, list):
+                v = "|".join(str(i) for i in v)
+            if v is None:
+                return ""
+            s = str(v).replace('"', '""')
+            return f'"{s}"' if ("," in s or "\n" in s or '"' in s) else s
+
+        lines.append(",".join(_cell(r.get(f)) for f in _CSV_FIELDS))
+
+    return func.HttpResponse(
+        "\n".join(lines),
+        status_code=200,
+        mimetype="text/csv",
+        headers={
+            **CORS_HEADERS,
+            "Content-Disposition": "attachment; filename=crisismap_export.csv",
+        },
+    )
+
+
+def _count_by(rows: list, field: str) -> dict:
+    counts: dict[str, int] = {}
+    for r in rows:
+        val = r.get(field, "unknown") or "unknown"
+        counts[val] = counts.get(val, 0) + 1
+    return counts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABASE SCHEMA — Run once in Supabase SQL Editor
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# -- Enable UUID extension
+# CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+#
+# -- Main reports table
+# CREATE TABLE IF NOT EXISTS reports (
+#   id                      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+#   submitted_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+#   lat                     FLOAT8,
+#   lng                     FLOAT8,
+#   building_footprint_id   TEXT,
+#   location_description    TEXT,
+#   infrastructure_type     TEXT NOT NULL,
+#   infrastructure_type_other TEXT,
+#   infrastructure_name     TEXT,
+#   damage_level            TEXT NOT NULL CHECK (damage_level IN ('minimal','partial','complete')),
+#   crisis_type             TEXT NOT NULL,
+#   has_debris              TEXT,
+#   electricity_status      TEXT,
+#   health_services_status  TEXT,
+#   pressing_needs          TEXT[] DEFAULT '{}',
+#   image_urls              TEXT[] DEFAULT '{}',
+#   ai_damage_classification TEXT,
+#   ai_confidence_score     FLOAT4,
+#   ai_reasoning            TEXT,
+#   ai_recommended_action   TEXT,
+#   ai_priority_score       FLOAT4,
+#   area_signal_score       FLOAT4,
+#   is_duplicate_flagged    BOOLEAN DEFAULT FALSE,
+#   version_group_id        UUID,
+#   language_submitted      TEXT DEFAULT 'en',
+#   anonymous_device_id     TEXT NOT NULL
+# );
+#
+# -- Reporter safety alerts (no PII)
+# CREATE TABLE IF NOT EXISTS reporter_alerts (
+#   id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+#   alert_type           TEXT DEFAULT 'REPORTER_SAFETY_ALERT',
+#   anonymous_device_id  TEXT NOT NULL,
+#   coordinator_id       TEXT,
+#   lat                  FLOAT8,
+#   lng                  FLOAT8,
+#   accuracy_metres      FLOAT4,
+#   triggered_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+# );
+#
+# -- Index for bounding box and time queries
+# CREATE INDEX IF NOT EXISTS idx_reports_lat_lng ON reports (lat, lng);
+# CREATE INDEX IF NOT EXISTS idx_reports_submitted ON reports (submitted_at DESC);
+# CREATE INDEX IF NOT EXISTS idx_reports_damage ON reports (damage_level);
+# CREATE INDEX IF NOT EXISTS idx_reports_building ON reports (building_footprint_id);
+#
+# -- Enable Row Level Security and allow anonymous read/insert
+# ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
+# CREATE POLICY "anon_insert" ON reports FOR INSERT TO anon WITH CHECK (true);
+# CREATE POLICY "anon_select" ON reports FOR SELECT TO anon USING (true);
+#
+# ALTER TABLE reporter_alerts ENABLE ROW LEVEL SECURITY;
+# CREATE POLICY "anon_insert_alerts" ON reporter_alerts FOR INSERT TO anon WITH CHECK (true);
+#
+# -- Create Storage bucket for report images
+# INSERT INTO storage.buckets (id, name, public)
+#   VALUES ('report-images', 'report-images', true)
+#   ON CONFLICT DO NOTHING;
+#
+# CREATE POLICY "anon_upload" ON storage.objects FOR INSERT TO anon
+#   WITH CHECK (bucket_id = 'report-images');
+# CREATE POLICY "public_read" ON storage.objects FOR SELECT TO anon
+#   USING (bucket_id = 'report-images');
+# ══════════════════════════════════════════════════════════════════════════════

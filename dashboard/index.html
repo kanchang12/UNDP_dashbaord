@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<!-- MIT Licence — CrisisMap, UNDP Crisis Damage Reporting Dashboard -->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CrisisMap — UNDP Crisis Damage Reporting</title>
+
+<!-- Leaflet CSS -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<!-- Marker Cluster CSS -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+:root {
+  --blue:    #009EDB;
+  --blue-dim: rgba(0,158,219,0.15);
+  --green:   #2ECC71;
+  --amber:   #F39C12;
+  --red:     #E74C3C;
+  --bg:      #0A0E1A;
+  --bg2:     #111827;
+  --bg3:     #1E2A3A;
+  --border:  rgba(255,255,255,0.08);
+  --text:    #F0F4F8;
+  --muted:   #6B7280;
+  --header-h: 58px;
+}
+html, body { height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:'Inter',sans-serif; font-size:13px; }
+
+/* ── HEADER ─────────────────────────────────────────────────────────────── */
+#header {
+  position:fixed; top:0; left:0; right:0; z-index:500;
+  height:var(--header-h);
+  background:var(--bg2); border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:10px; padding:0 16px;
+}
+.logo { font-size:16px; font-weight:700; color:var(--text); white-space:nowrap; }
+.logo span { color:var(--blue); }
+.live-dot { width:7px; height:7px; border-radius:50%; background:var(--blue); animation:pulse-dot 1.4s ease-in-out infinite; flex-shrink:0; }
+@keyframes pulse-dot { 0%,100%{box-shadow:0 0 0 0 rgba(0,158,219,.5)} 60%{box-shadow:0 0 0 6px rgba(0,158,219,0)} }
+
+.filter-group { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-left:12px; }
+.filter-select {
+  background:var(--bg3); color:var(--text); border:1px solid var(--border);
+  border-radius:6px; padding:4px 8px; font-size:12px; font-family:'Inter',sans-serif;
+  cursor:pointer; outline:none;
+}
+.filter-select:focus { border-color:var(--blue); }
+
+.header-right { margin-left:auto; display:flex; align-items:center; gap:8px; }
+.btn-small {
+  background:var(--bg3); color:var(--text); border:1px solid var(--border);
+  border-radius:6px; padding:5px 11px; font-size:12px; cursor:pointer;
+  font-family:'Inter',sans-serif; transition:background .15s;
+  display:flex; align-items:center; gap:5px; white-space:nowrap;
+}
+.btn-small:hover { background:var(--blue-dim); border-color:var(--blue); }
+.btn-small.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
+.btn-small.primary:hover { opacity:.9; }
+#last-update { font-size:11px; color:var(--muted); white-space:nowrap; }
+
+/* ── LAYOUT ──────────────────────────────────────────────────────────────── */
+#app {
+  position:fixed;
+  top:var(--header-h); left:0; right:0; bottom:0;
+  display:flex;
+}
+
+/* ── MAP PANEL ──────────────────────────────────────────────────────────── */
+#map-panel { flex:1; position:relative; min-width:0; }
+#map { position:absolute; inset:0; }
+
+.map-controls {
+  position:absolute; top:10px; left:10px; z-index:400;
+  display:flex; flex-direction:column; gap:6px;
+}
+.map-btn {
+  background:var(--bg2); color:var(--text); border:1px solid var(--border);
+  border-radius:7px; padding:6px 11px; font-size:11px; cursor:pointer;
+  font-family:'Inter',sans-serif; transition:background .15s; white-space:nowrap;
+}
+.map-btn:hover, .map-btn.active { background:var(--blue-dim); border-color:var(--blue); color:var(--blue); }
+
+/* ── ANALYTICS PANEL ─────────────────────────────────────────────────────── */
+#analytics-panel {
+  width:360px; flex-shrink:0;
+  background:var(--bg2); border-left:1px solid var(--border);
+  display:flex; flex-direction:column; overflow:hidden;
+}
+#analytics-scroll { flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:12px; }
+#analytics-scroll::-webkit-scrollbar { width:3px; }
+#analytics-scroll::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+
+/* ── STAT CARDS ─────────────────────────────────────────────────────────── */
+.stats-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
+.stat-card {
+  background:var(--bg3); border:1px solid var(--border); border-radius:10px;
+  padding:10px; text-align:center;
+}
+.stat-num { font-size:22px; font-weight:700; line-height:1.1; }
+.stat-num.blue   { color:var(--blue); }
+.stat-num.green  { color:var(--green); }
+.stat-num.amber  { color:var(--amber); }
+.stat-num.red    { color:var(--red); }
+.stat-label { font-size:9px; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; margin-top:3px; }
+
+/* ── SECTION CARD ────────────────────────────────────────────────────────── */
+.section-card {
+  background:var(--bg3); border:1px solid var(--border); border-radius:10px;
+  overflow:hidden;
+}
+.section-title {
+  padding:10px 14px; font-size:11px; font-weight:600;
+  text-transform:uppercase; letter-spacing:.8px; color:var(--muted);
+  border-bottom:1px solid var(--border);
+}
+.section-body { padding:12px; }
+
+/* ── CHART CANVAS ────────────────────────────────────────────────────────── */
+.chart-wrap { position:relative; height:180px; }
+
+/* ── PRIORITY QUEUE ──────────────────────────────────────────────────────── */
+.priority-item {
+  display:flex; align-items:center; gap:10px;
+  padding:8px 0; border-bottom:1px solid var(--border);
+}
+.priority-item:last-child { border-bottom:none; }
+.priority-score {
+  min-width:38px; height:38px; border-radius:8px;
+  display:flex; align-items:center; justify-content:center;
+  font-size:12px; font-weight:700; flex-shrink:0;
+}
+.priority-score.high { background:rgba(231,76,60,.2); color:var(--red); }
+.priority-score.mid  { background:rgba(243,156,18,.2); color:var(--amber); }
+.priority-score.low  { background:rgba(46,204,113,.2); color:var(--green); }
+.priority-info { flex:1; min-width:0; }
+.priority-infra { font-size:12px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.priority-action { font-size:11px; color:var(--muted); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.priority-damage { font-size:10px; padding:2px 7px; border-radius:10px; flex-shrink:0; font-weight:600; }
+
+/* ── AI INSIGHT PANEL ────────────────────────────────────────────────────── */
+#insight-panel {
+  position:fixed; bottom:0; left:0; right:360px; z-index:450;
+  background:var(--bg2); border-top:1px solid var(--border);
+  max-height:0; overflow:hidden; transition:max-height .35s ease;
+}
+#insight-panel.open { max-height:420px; overflow-y:auto; }
+#insight-panel::-webkit-scrollbar { width:3px; }
+#insight-panel::-webkit-scrollbar-thumb { background:var(--border); }
+
+#insight-close {
+  position:sticky; top:0; right:0; float:right;
+  background:var(--bg3); border:none; color:var(--muted);
+  padding:8px 14px; cursor:pointer; font-size:20px; line-height:1;
+  border-left:1px solid var(--border); border-bottom:1px solid var(--border);
+  border-bottom-left-radius:8px;
+}
+#insight-close:hover { color:var(--text); }
+
+.insight-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:14px; }
+.insight-left { display:flex; flex-direction:column; gap:10px; }
+.insight-right { display:flex; flex-direction:column; gap:10px; }
+.insight-label { font-size:9px; color:var(--muted); text-transform:uppercase; letter-spacing:.7px; margin-bottom:3px; }
+.insight-value { font-size:13px; color:var(--text); }
+.insight-box { background:var(--bg3); border:1px solid var(--border); border-radius:8px; padding:10px; }
+
+.photo-row { display:flex; gap:6px; flex-wrap:wrap; }
+.photo-thumb {
+  width:80px; height:60px; object-fit:cover; border-radius:6px;
+  border:1px solid var(--border); cursor:pointer; transition:opacity .15s;
+}
+.photo-thumb:hover { opacity:.85; }
+
+.version-item { font-size:11px; color:var(--muted); padding:4px 0; border-bottom:1px solid var(--border); }
+.version-item:last-child { border-bottom:none; }
+.version-item span { font-weight:600; }
+
+/* ── LEGEND ─────────────────────────────────────────────────────────────── */
+.legend {
+  position:absolute; bottom:12px; left:10px; z-index:400;
+  background:var(--bg2); border:1px solid var(--border); border-radius:8px;
+  padding:8px 12px; display:flex; flex-direction:column; gap:4px;
+}
+.legend-item { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--muted); }
+.legend-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+
+/* ── MOBILE ──────────────────────────────────────────────────────────────── */
+@media (max-width: 900px) {
+  #analytics-panel { display:none; }
+  #insight-panel { right:0; }
+  .filter-group { display:none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ── HEADER ─────────────────────────────────────────────────────────────── -->
+<div id="header">
+  <div class="live-dot"></div>
+  <div class="logo">Crisis<span>Map</span></div>
+
+  <div class="filter-group">
+    <select class="filter-select" id="f-damage" onchange="applyFilters()">
+      <option value="" data-i="filterAll">All damage</option>
+      <option value="minimal" data-i="damageMinimal">Minimal</option>
+      <option value="partial" data-i="damagePartial">Partial</option>
+      <option value="complete" data-i="damageComplete">Complete</option>
+    </select>
+    <select class="filter-select" id="f-crisis" onchange="applyFilters()">
+      <option value="" data-i="filterAll">All crises</option>
+      <option value="earthquake" data-i="crisisEarthquake">Earthquake</option>
+      <option value="flood" data-i="crisisFlood">Flood</option>
+      <option value="tsunami" data-i="crisisTsunami">Tsunami</option>
+      <option value="hurricane" data-i="crisisHurricane">Hurricane</option>
+      <option value="wildfire" data-i="crisisWildfire">Wildfire</option>
+      <option value="explosion" data-i="crisisExplosion">Explosion</option>
+      <option value="chemical" data-i="crisisChemical">Chemical</option>
+      <option value="conflict" data-i="crisisConflict">Conflict</option>
+      <option value="civilUnrest" data-i="crisisCivilUnrest">Civil Unrest</option>
+    </select>
+    <select class="filter-select" id="f-infra" onchange="applyFilters()">
+      <option value="" data-i="filterAll">All infrastructure</option>
+      <option value="residential" data-i="infraResidential">Residential</option>
+      <option value="commercial" data-i="infraCommercial">Commercial</option>
+      <option value="government" data-i="infraGovernment">Government</option>
+      <option value="utility" data-i="infraUtility">Utility</option>
+      <option value="transport" data-i="infraTransport">Transport</option>
+      <option value="community" data-i="infraCommunity">Community</option>
+      <option value="publicRecreation" data-i="infraPublic">Public/Recreation</option>
+    </select>
+    <input type="date" class="filter-select" id="f-date-from" onchange="applyFilters()" placeholder="From">
+    <input type="date" class="filter-select" id="f-date-to" onchange="applyFilters()" placeholder="To">
+    <button class="btn-small" onclick="resetFilters()" data-i="resetFilters">Reset</button>
+  </div>
+
+  <div class="header-right">
+    <div id="last-update">—</div>
+    <button class="btn-small" onclick="exportData('csv')" data-i="exportCSV">⬇ CSV</button>
+    <button class="btn-small" onclick="exportData('geojson')" data-i="exportGeoJSON">⬇ GeoJSON</button>
+    <select class="filter-select" id="lang-select" onchange="setLanguage(this.value)">
+      <option value="en">English</option>
+      <option value="ar">العربية</option>
+      <option value="zh">中文</option>
+      <option value="fr">Français</option>
+      <option value="ru">Русский</option>
+      <option value="es">Español</option>
+    </select>
+  </div>
+</div>
+
+<!-- ── MAIN APP ────────────────────────────────────────────────────────────── -->
+<div id="app">
+
+  <!-- Left: Map -->
+  <div id="map-panel">
+    <div id="map"></div>
+
+    <div class="map-controls">
+      <button class="map-btn" id="btn-heatmap" onclick="toggleHeatmap()" data-i="toggleHeatmap">Heatmap</button>
+      <button class="map-btn" id="btn-clusters" onclick="toggleClusters()" data-i="toggleClusters">Clusters</button>
+    </div>
+
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot" style="background:#2ECC71"></div><span data-i="damageMinimal">Minimal</span></div>
+      <div class="legend-item"><div class="legend-dot" style="background:#F39C12"></div><span data-i="damagePartial">Partial</span></div>
+      <div class="legend-item"><div class="legend-dot" style="background:#E74C3C"></div><span data-i="damageComplete">Complete</span></div>
+    </div>
+  </div>
+
+  <!-- Right: Analytics -->
+  <div id="analytics-panel">
+    <div id="analytics-scroll">
+
+      <!-- Totals -->
+      <div class="stats-grid" id="stats-grid">
+        <div class="stat-card"><div class="stat-num blue" id="s-total">—</div><div class="stat-label" data-i="statTotal">Total</div></div>
+        <div class="stat-card"><div class="stat-num amber" id="s-partial">—</div><div class="stat-label" data-i="damagePartial">Partial</div></div>
+        <div class="stat-card"><div class="stat-num red" id="s-complete">—</div><div class="stat-label" data-i="damageComplete">Complete</div></div>
+      </div>
+
+      <!-- Damage doughnut -->
+      <div class="section-card">
+        <div class="section-title" data-i="chartDamage">Damage Levels</div>
+        <div class="section-body">
+          <div class="chart-wrap"><canvas id="chart-damage"></canvas></div>
+        </div>
+      </div>
+
+      <!-- Infrastructure bar -->
+      <div class="section-card">
+        <div class="section-title" data-i="chartInfra">Infrastructure Types</div>
+        <div class="section-body">
+          <div class="chart-wrap" style="height:200px"><canvas id="chart-infra"></canvas></div>
+        </div>
+      </div>
+
+      <!-- Crisis type bar -->
+      <div class="section-card">
+        <div class="section-title" data-i="chartCrisis">Crisis Types</div>
+        <div class="section-body">
+          <div class="chart-wrap"><canvas id="chart-crisis"></canvas></div>
+        </div>
+      </div>
+
+      <!-- Timeline -->
+      <div class="section-card">
+        <div class="section-title" data-i="chartTimeline">Submissions — Last 24h</div>
+        <div class="section-body">
+          <div class="chart-wrap"><canvas id="chart-timeline"></canvas></div>
+        </div>
+      </div>
+
+      <!-- Priority queue -->
+      <div class="section-card">
+        <div class="section-title" data-i="priorityQueue">Priority Queue</div>
+        <div class="section-body" id="priority-list">
+          <div style="color:var(--muted);font-size:12px;" data-i="loading">Loading…</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ── AI INSIGHT PANEL ────────────────────────────────────────────────────── -->
+<div id="insight-panel">
+  <button id="insight-close" onclick="closeInsight()">×</button>
+  <div class="insight-grid">
+    <div class="insight-left">
+      <div class="insight-box">
+        <div class="insight-label" data-i="insightAI">AI Assessment</div>
+        <div id="ins-ai-damage" style="font-size:16px;font-weight:700;margin-bottom:4px;">—</div>
+        <div id="ins-ai-confidence" style="font-size:11px;color:var(--muted);">—</div>
+        <div id="ins-ai-reasoning" style="font-size:12px;color:var(--muted);margin-top:6px;line-height:1.5;">—</div>
+      </div>
+      <div class="insight-box">
+        <div class="insight-label" data-i="insightAction">Recommended Action</div>
+        <div id="ins-action" style="font-size:12px;line-height:1.5;">—</div>
+      </div>
+      <div class="insight-box">
+        <div class="insight-label" data-i="insightArea">Area Signals</div>
+        <div id="ins-area" style="font-size:12px;color:var(--muted);">—</div>
+      </div>
+      <div class="insight-box">
+        <div class="insight-label" data-i="insightHistory">Version History</div>
+        <div id="ins-history">—</div>
+      </div>
+    </div>
+    <div class="insight-right">
+      <div class="insight-box">
+        <div class="insight-label" data-i="insightDetails">Report Details</div>
+        <table id="ins-details" style="font-size:11px;width:100%;border-collapse:collapse;"></table>
+      </div>
+      <div class="insight-box">
+        <div class="insight-label" data-i="insightPhotos">Photos</div>
+        <div class="photo-row" id="ins-photos">—</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Leaflet JS -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Marker Cluster -->
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<!-- Leaflet Heat -->
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+<!-- Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+
+<script>
+'use strict';
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const API_BASE = (window.API_BASE_URL || 'https://your-azure-function-app.azurewebsites.net/api').replace(/\/$/, '');
+const REFRESH_MS = 30_000;
+
+// ── i18n ──────────────────────────────────────────────────────────────────────
+const LANGS = {
+  en: {
+    filterAll:'All', resetFilters:'Reset', exportCSV:'⬇ CSV', exportGeoJSON:'⬇ GeoJSON',
+    toggleHeatmap:'Heatmap', toggleClusters:'Clusters',
+    statTotal:'Total', chartDamage:'Damage Levels', chartInfra:'Infrastructure Types',
+    chartCrisis:'Crisis Types', chartTimeline:'Submissions — Last 24h', priorityQueue:'Priority Queue',
+    loading:'Loading…', insightAI:'AI Assessment', insightAction:'Recommended Action',
+    insightArea:'Area Signals', insightHistory:'Version History', insightDetails:'Report Details',
+    insightPhotos:'Photos', nReports:'reports', lastUpdated:'Updated',
+    damageMinimal:'Minimal', damagePartial:'Partial', damageComplete:'Complete',
+    infraResidential:'Residential', infraCommercial:'Commercial', infraGovernment:'Government',
+    infraUtility:'Utility', infraTransport:'Transport', infraCommunity:'Community', infraPublic:'Public/Recreation',
+    crisisEarthquake:'Earthquake', crisisFlood:'Flood', crisisTsunami:'Tsunami',
+    crisisHurricane:'Hurricane', crisisWildfire:'Wildfire', crisisExplosion:'Explosion',
+    crisisChemical:'Chemical', crisisConflict:'Conflict', crisisCivilUnrest:'Civil Unrest',
+    nearbySignal:'other reports within 500m in last 2h',
+  },
+  ar: {
+    filterAll:'الكل', resetFilters:'إعادة تعيين', exportCSV:'⬇ CSV', exportGeoJSON:'⬇ GeoJSON',
+    toggleHeatmap:'خريطة حرارية', toggleClusters:'مجموعات',
+    statTotal:'الإجمالي', chartDamage:'مستويات الضرر', chartInfra:'أنواع البنية التحتية',
+    chartCrisis:'أنواع الأزمات', chartTimeline:'الإرسالات — آخر 24 ساعة', priorityQueue:'قائمة الأولويات',
+    loading:'جارٍ التحميل…', insightAI:'تقييم الذكاء الاصطناعي', insightAction:'الإجراء الموصى به',
+    insightArea:'إشارات المنطقة', insightHistory:'سجل الإصدارات', insightDetails:'تفاصيل التقرير',
+    insightPhotos:'الصور', nReports:'تقارير', lastUpdated:'تحديث',
+    damageMinimal:'ضئيل', damagePartial:'جزئي', damageComplete:'كلي',
+    infraResidential:'سكني', infraCommercial:'تجاري', infraGovernment:'حكومي',
+    infraUtility:'خدمات', infraTransport:'نقل', infraCommunity:'مجتمعي', infraPublic:'عام',
+    crisisEarthquake:'زلزال', crisisFlood:'فيضان', crisisTsunami:'تسونامي',
+    crisisHurricane:'إعصار', crisisWildfire:'حريق', crisisExplosion:'انفجار',
+    crisisChemical:'كيميائي', crisisConflict:'نزاع', crisisCivilUnrest:'اضطرابات',
+    nearbySignal:'تقارير أخرى ضمن 500م في آخر ساعتين',
+  },
+  zh: {
+    filterAll:'全部', resetFilters:'重置', exportCSV:'⬇ CSV', exportGeoJSON:'⬇ GeoJSON',
+    toggleHeatmap:'热力图', toggleClusters:'聚类',
+    statTotal:'总计', chartDamage:'损害等级', chartInfra:'基础设施类型',
+    chartCrisis:'危机类型', chartTimeline:'提交记录 — 过去24小时', priorityQueue:'优先队列',
+    loading:'加载中…', insightAI:'AI评估', insightAction:'建议措施',
+    insightArea:'区域信号', insightHistory:'版本历史', insightDetails:'报告详情',
+    insightPhotos:'照片', nReports:'份报告', lastUpdated:'已更新',
+    damageMinimal:'轻微', damagePartial:'部分', damageComplete:'完全',
+    infraResidential:'住宅', infraCommercial:'商业', infraGovernment:'政府',
+    infraUtility:'公用设施', infraTransport:'交通', infraCommunity:'社区', infraPublic:'公共',
+    crisisEarthquake:'地震', crisisFlood:'洪水', crisisTsunami:'海啸',
+    crisisHurricane:'飓风', crisisWildfire:'野火', crisisExplosion:'爆炸',
+    crisisChemical:'化学', crisisConflict:'冲突', crisisCivilUnrest:'动乱',
+    nearbySignal:'其他报告在500米范围内过去2小时',
+  },
+  fr: {
+    filterAll:'Tous', resetFilters:'Réinitialiser', exportCSV:'⬇ CSV', exportGeoJSON:'⬇ GeoJSON',
+    toggleHeatmap:'Carte thermique', toggleClusters:'Groupes',
+    statTotal:'Total', chartDamage:'Niveaux de dommages', chartInfra:'Types d\'infrastructure',
+    chartCrisis:'Types de crise', chartTimeline:'Soumissions — 24 dernières heures', priorityQueue:'File de priorité',
+    loading:'Chargement…', insightAI:'Évaluation IA', insightAction:'Action recommandée',
+    insightArea:'Signaux de zone', insightHistory:'Historique des versions', insightDetails:'Détails du rapport',
+    insightPhotos:'Photos', nReports:'rapports', lastUpdated:'Mis à jour',
+    damageMinimal:'Minimal', damagePartial:'Partiel', damageComplete:'Complet',
+    infraResidential:'Résidentiel', infraCommercial:'Commercial', infraGovernment:'Gouvernemental',
+    infraUtility:'Utilitaire', infraTransport:'Transport', infraCommunity:'Communautaire', infraPublic:'Public',
+    crisisEarthquake:'Tremblement de terre', crisisFlood:'Inondation', crisisTsunami:'Tsunami',
+    crisisHurricane:'Ouragan', crisisWildfire:'Incendie', crisisExplosion:'Explosion',
+    crisisChemical:'Chimique', crisisConflict:'Conflit', crisisCivilUnrest:'Troubles civils',
+    nearbySignal:'autres rapports à 500m dans les 2 dernières heures',
+  },
+  ru: {
+    filterAll:'Все', resetFilters:'Сбросить', exportCSV:'⬇ CSV', exportGeoJSON:'⬇ GeoJSON',
+    toggleHeatmap:'Тепловая карта', toggleClusters:'Кластеры',
+    statTotal:'Всего', chartDamage:'Уровни ущерба', chartInfra:'Типы инфраструктуры',
+    chartCrisis:'Типы кризисов', chartTimeline:'Отчёты — последние 24 ч', priorityQueue:'Очередь приоритетов',
+    loading:'Загрузка…', insightAI:'Оценка ИИ', insightAction:'Рекомендуемое действие',
+    insightArea:'Сигналы зоны', insightHistory:'История версий', insightDetails:'Детали отчёта',
+    insightPhotos:'Фотографии', nReports:'отчётов', lastUpdated:'Обновлено',
+    damageMinimal:'Минимальный', damagePartial:'Частичный', damageComplete:'Полный',
+    infraResidential:'Жилой', infraCommercial:'Коммерческий', infraGovernment:'Государственный',
+    infraUtility:'Коммунальный', infraTransport:'Транспорт', infraCommunity:'Общественный', infraPublic:'Публичный',
+    crisisEarthquake:'Землетрясение', crisisFlood:'Наводнение', crisisTsunami:'Цунами',
+    crisisHurricane:'Ураган', crisisWildfire:'Пожар', crisisExplosion:'Взрыв',
+    crisisChemical:'Химическое', crisisConflict:'Конфликт', crisisCivilUnrest:'Беспорядки',
+    nearbySignal:'других отчётов в радиусе 500м за последние 2 ч',
+  },
+  es: {
+    filterAll:'Todos', resetFilters:'Restablecer', exportCSV:'⬇ CSV', exportGeoJSON:'⬇ GeoJSON',
+    toggleHeatmap:'Mapa de calor', toggleClusters:'Clústeres',
+    statTotal:'Total', chartDamage:'Niveles de daño', chartInfra:'Tipos de infraestructura',
+    chartCrisis:'Tipos de crisis', chartTimeline:'Envíos — últimas 24h', priorityQueue:'Cola de prioridad',
+    loading:'Cargando…', insightAI:'Evaluación IA', insightAction:'Acción recomendada',
+    insightArea:'Señales del área', insightHistory:'Historial de versiones', insightDetails:'Detalles del informe',
+    insightPhotos:'Fotos', nReports:'informes', lastUpdated:'Actualizado',
+    damageMinimal:'Mínimo', damagePartial:'Parcial', damageComplete:'Completo',
+    infraResidential:'Residencial', infraCommercial:'Comercial', infraGovernment:'Gubernamental',
+    infraUtility:'Servicios', infraTransport:'Transporte', infraCommunity:'Comunitario', infraPublic:'Público',
+    crisisEarthquake:'Terremoto', crisisFlood:'Inundación', crisisTsunami:'Tsunami',
+    crisisHurricane:'Huracán', crisisWildfire:'Incendio', crisisExplosion:'Explosión',
+    crisisChemical:'Químico', crisisConflict:'Conflicto', crisisCivilUnrest:'Disturbios',
+    nearbySignal:'otros informes a 500m en las últimas 2h',
+  },
+};
+
+let lang = localStorage.getItem('cm_lang') || navigator.language.split('-')[0];
+if (!LANGS[lang]) lang = 'en';
+
+function t(key) { return (LANGS[lang] || LANGS.en)[key] || key; }
+
+function applyI18n() {
+  document.documentElement.lang = lang;
+  document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
+  document.querySelectorAll('[data-i]').forEach(el => {
+    const k = el.dataset.i;
+    if (el.tagName === 'OPTION') el.text = t(k);
+    else el.textContent = t(k);
+  });
+  document.getElementById('lang-select').value = lang;
+}
+
+function setLanguage(l) {
+  lang = l;
+  localStorage.setItem('cm_lang', l);
+  applyI18n();
+  renderAll();
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let allReports = [];
+let filteredReports = [];
+let stats = null;
+let map, markerCluster, heatLayer;
+let markers = [];
+let heatmapVisible = false;
+let clustersEnabled = true;
+let charts = {};
+let refreshTimer = null;
+
+// ── Map init ──────────────────────────────────────────────────────────────────
+function initMap() {
+  map = L.map('map', { zoomControl: true }).setView([20, 0], 2);
+
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    maxZoom: 19,
+  }).addTo(map);
+
+  markerCluster = L.markerClusterGroup({ chunkedLoading: true });
+  map.addLayer(markerCluster);
+}
+
+// ── Fetch data ────────────────────────────────────────────────────────────────
+async function fetchAll() {
+  try {
+    const [geoRes, statsRes] = await Promise.all([
+      fetch(`${API_BASE}/reports`),
+      fetch(`${API_BASE}/dashboard-stats`),
+    ]);
+
+    if (geoRes.ok) {
+      const geo = await geoRes.json();
+      allReports = (geo.features || []).map(f => ({ ...f.properties, lat: f.geometry?.coordinates[1], lng: f.geometry?.coordinates[0] }));
+    }
+
+    if (statsRes.ok) {
+      stats = await statsRes.json();
+    }
+
+    applyFilters();
+    document.getElementById('last-update').textContent = `${t('lastUpdated')}: ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    document.getElementById('last-update').textContent = 'Offline';
+  }
+}
+
+// ── Filters ───────────────────────────────────────────────────────────────────
+function applyFilters() {
+  const damage = document.getElementById('f-damage').value;
+  const crisis = document.getElementById('f-crisis').value;
+  const infra  = document.getElementById('f-infra').value;
+  const from   = document.getElementById('f-date-from').value;
+  const to     = document.getElementById('f-date-to').value;
+
+  filteredReports = allReports.filter(r => {
+    if (damage && r.damage_level !== damage) return false;
+    if (crisis && r.crisis_type !== crisis) return false;
+    if (infra  && r.infrastructure_type !== infra) return false;
+    if (from && r.submitted_at < from) return false;
+    if (to   && r.submitted_at > to + 'T23:59:59') return false;
+    return true;
+  });
+
+  renderAll();
+}
+
+function resetFilters() {
+  ['f-damage','f-crisis','f-infra'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('f-date-from').value = '';
+  document.getElementById('f-date-to').value = '';
+  applyFilters();
+}
+
+// ── Render everything ─────────────────────────────────────────────────────────
+function renderAll() {
+  renderMarkers();
+  renderStats();
+  renderCharts();
+  renderPriorityQueue();
+}
+
+// ── Markers ───────────────────────────────────────────────────────────────────
+const DAMAGE_COLOURS = { minimal: '#2ECC71', partial: '#F39C12', complete: '#E74C3C' };
+
+function makeIcon(colour) {
+  return L.divIcon({
+    className: '',
+    html: `<svg width="20" height="28" viewBox="0 0 20 28" xmlns="http://www.w3.org/2000/svg">
+      <path d="M10 0C4.5 0 0 4.5 0 10c0 7.5 10 18 10 18S20 17.5 20 10C20 4.5 15.5 0 10 0z" fill="${colour}" opacity=".9"/>
+      <circle cx="10" cy="10" r="4" fill="white" opacity=".8"/>
+    </svg>`,
+    iconSize: [20, 28],
+    iconAnchor: [10, 28],
+    popupAnchor: [0, -28],
+  });
+}
+
+function renderMarkers() {
+  markerCluster.clearLayers();
+  markers = [];
+
+  // Build heatmap data simultaneously
+  const heatData = [];
+
+  filteredReports.forEach(r => {
+    if (!r.lat || !r.lng) return;
+    const colour = DAMAGE_COLOURS[r.damage_level] || '#999';
+    const m = L.marker([r.lat, r.lng], { icon: makeIcon(colour) });
+    m.on('click', () => openInsight(r));
+    markerCluster.addLayer(m);
+    markers.push(m);
+
+    const intensity = r.damage_level === 'complete' ? 1.0 : r.damage_level === 'partial' ? 0.6 : 0.3;
+    heatData.push([r.lat, r.lng, intensity]);
+  });
+
+  // Rebuild heat layer
+  if (heatLayer) map.removeLayer(heatLayer);
+  heatLayer = L.heatLayer(heatData, { radius: 25, blur: 20, maxZoom: 13 });
+  if (heatmapVisible) map.addLayer(heatLayer);
+}
+
+function toggleHeatmap() {
+  heatmapVisible = !heatmapVisible;
+  if (heatmapVisible) {
+    map.addLayer(heatLayer);
+    markerCluster.remove();
+    document.getElementById('btn-heatmap').classList.add('active');
+  } else {
+    map.removeLayer(heatLayer);
+    map.addLayer(markerCluster);
+    document.getElementById('btn-heatmap').classList.remove('active');
+  }
+}
+
+function toggleClusters() {
+  clustersEnabled = !clustersEnabled;
+  if (clustersEnabled) {
+    map.addLayer(markerCluster);
+    document.getElementById('btn-clusters').classList.add('active');
+  } else {
+    map.removeLayer(markerCluster);
+    // Add individual markers
+    markers.forEach(m => m.addTo(map));
+    document.getElementById('btn-clusters').classList.remove('active');
+  }
+}
+
+// ── Stats cards ───────────────────────────────────────────────────────────────
+function renderStats() {
+  document.getElementById('s-total').textContent = filteredReports.length;
+  document.getElementById('s-partial').textContent = filteredReports.filter(r => r.damage_level === 'partial').length;
+  document.getElementById('s-complete').textContent = filteredReports.filter(r => r.damage_level === 'complete').length;
+}
+
+// ── Charts ────────────────────────────────────────────────────────────────────
+const CHART_DEFAULTS = {
+  responsive: true, maintainAspectRatio: false,
+  plugins: { legend: { labels: { color: '#9CA3AF', font: { family: 'Inter', size: 11 } } } },
+};
+
+function countBy(arr, field) {
+  const m = {};
+  arr.forEach(r => { const v = r[field] || 'unknown'; m[v] = (m[v] || 0) + 1; });
+  return m;
+}
+
+function renderCharts() {
+  const dmg = countBy(filteredReports, 'damage_level');
+  const infra = countBy(filteredReports, 'infrastructure_type');
+  const crisis = countBy(filteredReports, 'crisis_type');
+
+  // Damage doughnut
+  buildChart('chart-damage', 'doughnut', {
+    labels: ['minimal','partial','complete'].map(k => t('damage' + k.charAt(0).toUpperCase() + k.slice(1))),
+    datasets: [{
+      data: ['minimal','partial','complete'].map(k => dmg[k] || 0),
+      backgroundColor: ['#2ECC71','#F39C12','#E74C3C'],
+      borderWidth: 0,
+    }],
+  }, { ...CHART_DEFAULTS });
+
+  // Infrastructure bar
+  const infraKeys = Object.keys(infra).sort((a,b) => infra[b] - infra[a]).slice(0, 8);
+  buildChart('chart-infra', 'bar', {
+    labels: infraKeys.map(k => t('infra' + k.charAt(0).toUpperCase() + k.slice(1)) || k),
+    datasets: [{
+      data: infraKeys.map(k => infra[k]),
+      backgroundColor: '#009EDB88',
+      borderColor: '#009EDB',
+      borderWidth: 1,
+    }],
+  }, {
+    ...CHART_DEFAULTS,
+    indexAxis: 'y',
+    plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
+    scales: {
+      x: { ticks: { color: '#6B7280', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+      y: { ticks: { color: '#9CA3AF', font: { size: 10 } }, grid: { display: false } },
+    },
+  });
+
+  // Crisis type doughnut
+  const crisisKeys = Object.keys(crisis);
+  buildChart('chart-crisis', 'doughnut', {
+    labels: crisisKeys.map(k => t('crisis' + k.charAt(0).toUpperCase() + k.slice(1)) || k),
+    datasets: [{
+      data: crisisKeys.map(k => crisis[k]),
+      backgroundColor: ['#3498DB','#E74C3C','#2ECC71','#F39C12','#9B59B6','#1ABC9C','#E67E22','#E91E63','#00BCD4'],
+      borderWidth: 0,
+    }],
+  }, { ...CHART_DEFAULTS });
+
+  // Timeline (use stats API data if available, otherwise compute locally)
+  let tLabels = [], tData = [];
+  if (stats && stats.timeline_24h) {
+    tLabels = stats.timeline_24h.map(b => b.hour);
+    tData = stats.timeline_24h.map(b => b.count);
+  } else {
+    const now = new Date();
+    const buckets = {};
+    for (let h = 23; h >= 0; h--) {
+      const d = new Date(now - h * 3600_000);
+      buckets[d.getHours().toString().padStart(2,'0') + ':00'] = 0;
+    }
+    filteredReports.forEach(r => {
+      try {
+        const ts = new Date(r.submitted_at);
+        const diff = (now - ts) / 3600_000;
+        if (diff <= 24) {
+          const k = ts.getHours().toString().padStart(2,'0') + ':00';
+          if (k in buckets) buckets[k]++;
+        }
+      } catch {}
+    });
+    tLabels = Object.keys(buckets);
+    tData = Object.values(buckets);
+  }
+  buildChart('chart-timeline', 'line', {
+    labels: tLabels,
+    datasets: [{
+      data: tData,
+      borderColor: '#009EDB',
+      backgroundColor: 'rgba(0,158,219,.1)',
+      fill: true,
+      tension: 0.4,
+      pointRadius: 2,
+    }],
+  }, {
+    ...CHART_DEFAULTS,
+    plugins: { ...CHART_DEFAULTS.plugins, legend: { display: false } },
+    scales: {
+      x: { ticks: { color: '#6B7280', font: { size: 9 }, maxTicksLimit: 8 }, grid: { color: 'rgba(255,255,255,0.05)' } },
+      y: { ticks: { color: '#6B7280', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+    },
+  });
+}
+
+function buildChart(id, type, data, options) {
+  if (charts[id]) charts[id].destroy();
+  const ctx = document.getElementById(id).getContext('2d');
+  charts[id] = new Chart(ctx, { type, data, options });
+}
+
+// ── Priority queue ────────────────────────────────────────────────────────────
+function renderPriorityQueue() {
+  const qData = stats?.priority_queue || filteredReports
+    .filter(r => r.ai_priority_score != null)
+    .sort((a,b) => b.ai_priority_score - a.ai_priority_score)
+    .slice(0, 10);
+
+  const el = document.getElementById('priority-list');
+  if (!qData || !qData.length) {
+    el.innerHTML = `<div style="color:var(--muted);font-size:12px;">${t('loading')}</div>`;
+    return;
+  }
+
+  el.innerHTML = qData.map(r => {
+    const score = Math.round(r.ai_priority_score || 0);
+    const cls = score >= 70 ? 'high' : score >= 40 ? 'mid' : 'low';
+    const dmgKey = 'damage' + (r.damage_level||'').charAt(0).toUpperCase() + (r.damage_level||'').slice(1);
+    const dmgColour = DAMAGE_COLOURS[r.damage_level] || '#999';
+    return `
+    <div class="priority-item" style="cursor:pointer" onclick="focusReport(${r.lat},${r.lng})">
+      <div class="priority-score ${cls}">${score}</div>
+      <div class="priority-info">
+        <div class="priority-infra">${t('infra' + (r.infrastructure_type||'').charAt(0).toUpperCase() + (r.infrastructure_type||'').slice(1)) || r.infrastructure_type || '—'}</div>
+        <div class="priority-action">${r.ai_recommended_action || '—'}</div>
+      </div>
+      <div class="priority-damage" style="background:${dmgColour}22;color:${dmgColour}">${t(dmgKey)}</div>
+    </div>`;
+  }).join('');
+}
+
+function focusReport(lat, lng) {
+  if (lat && lng) map.flyTo([lat, lng], 16, { duration: 1.2 });
+}
+
+// ── AI Insight panel ──────────────────────────────────────────────────────────
+function openInsight(r) {
+  const panel = document.getElementById('insight-panel');
+
+  // Damage badge
+  const dmgColour = DAMAGE_COLOURS[r.ai_damage_classification || r.damage_level] || '#999';
+  const dmgKey = 'damage' + (r.ai_damage_classification||r.damage_level||'').charAt(0).toUpperCase() + (r.ai_damage_classification||r.damage_level||'').slice(1);
+  document.getElementById('ins-ai-damage').innerHTML =
+    `<span style="color:${dmgColour}">${t(dmgKey) || r.ai_damage_classification || '—'}</span>` +
+    (r.ai_priority_score != null ? ` &nbsp;<span style="font-size:12px;color:var(--muted)">Priority: ${Math.round(r.ai_priority_score)}/100</span>` : '');
+  document.getElementById('ins-ai-confidence').textContent =
+    r.ai_confidence_score != null
+      ? `Confidence: ${Math.round(r.ai_confidence_score * 100)}%`
+      : '—';
+  document.getElementById('ins-ai-reasoning').textContent = r.ai_reasoning || '—';
+  document.getElementById('ins-action').textContent = r.ai_recommended_action || '—';
+
+  // Area signals
+  document.getElementById('ins-area').textContent = r.area_signal_score != null
+    ? `Area urgency: ${Math.round(r.area_signal_score * 100)}%`
+    : '—';
+
+  // Version history (other reports with same version_group_id)
+  if (r.version_group_id) {
+    const versions = allReports
+      .filter(x => x.version_group_id === r.version_group_id && x.id !== r.id)
+      .sort((a,b) => a.submitted_at > b.submitted_at ? -1 : 1)
+      .slice(0, 5);
+    document.getElementById('ins-history').innerHTML = versions.length
+      ? versions.map(v => `
+        <div class="version-item">
+          <span>${new Date(v.submitted_at).toLocaleString()}</span> — ${t('damage'+(v.damage_level||'').charAt(0).toUpperCase()+(v.damage_level||'').slice(1)) || v.damage_level || '—'}
+        </div>`).join('')
+      : `<div style="font-size:11px;color:var(--muted)">No earlier versions</div>`;
+  } else {
+    document.getElementById('ins-history').innerHTML = `<div style="font-size:11px;color:var(--muted)">First report for this location</div>`;
+  }
+
+  // Details table
+  const fields = [
+    ['infrastructure_type', 'Infrastructure'],
+    ['infrastructure_name', 'Name'],
+    ['damage_level', 'Reported damage'],
+    ['crisis_type', 'Crisis type'],
+    ['has_debris', 'Debris'],
+    ['electricity_status', 'Electricity'],
+    ['health_services_status', 'Health services'],
+    ['language_submitted', 'Language'],
+    ['submitted_at', 'Submitted'],
+  ];
+  document.getElementById('ins-details').innerHTML = fields
+    .filter(([k]) => r[k] != null && r[k] !== '')
+    .map(([k, label]) => {
+      let v = r[k];
+      if (k === 'submitted_at') v = new Date(v).toLocaleString();
+      return `<tr><td style="color:var(--muted);padding:3px 8px 3px 0;white-space:nowrap">${label}</td><td style="color:var(--text)">${v}</td></tr>`;
+    }).join('');
+
+  // Photos
+  const photoUrls = r.image_urls || [];
+  document.getElementById('ins-photos').innerHTML = photoUrls.length
+    ? photoUrls.map(url => `<img class="photo-thumb" src="${url}" alt="damage photo" onclick="window.open('${url}','_blank')" onerror="this.style.display='none'">`).join('')
+    : `<span style="color:var(--muted);font-size:12px">No photos</span>`;
+
+  panel.classList.add('open');
+  map.flyTo([r.lat, r.lng], 17, { duration: 1 });
+}
+
+function closeInsight() {
+  document.getElementById('insight-panel').classList.remove('open');
+}
+
+// ── Export ────────────────────────────────────────────────────────────────────
+async function exportData(format) {
+  const filters = {};
+  const damage = document.getElementById('f-damage').value;
+  const crisis = document.getElementById('f-crisis').value;
+  const infra  = document.getElementById('f-infra').value;
+  const from   = document.getElementById('f-date-from').value;
+  const to     = document.getElementById('f-date-to').value;
+  if (damage) filters.damage_level = damage;
+  if (crisis) filters.crisis_type = crisis;
+  if (infra)  filters.infrastructure_type = infra;
+  if (from)   filters.date_from = from;
+  if (to)     filters.date_to = to;
+
+  try {
+    const r = await fetch(`${API_BASE}/export`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filters, format }),
+    });
+    if (!r.ok) { alert('Export failed: ' + r.status); return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `crisismap_export.${format === 'geojson' ? 'geojson' : 'csv'}`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('Export failed: ' + e.message);
+  }
+}
+
+// ── Auto-refresh ──────────────────────────────────────────────────────────────
+function startRefresh() {
+  fetchAll();
+  refreshTimer = setInterval(fetchAll, REFRESH_MS);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+initMap();
+applyI18n();
+startRefresh();
+</script>
+</body>
+</html>
