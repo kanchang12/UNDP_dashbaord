@@ -908,6 +908,23 @@ async function exportData(format) {
   }
 }
 
+async function resizeImage(base64Str) {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.src = base64Str;
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            const MAX_WIDTH = 512;
+            const scaleSize = MAX_WIDTH / img.width;
+            canvas.width = MAX_WIDTH;
+            canvas.height = img.height * scaleSize;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            resolve(canvas.toDataURL('image/jpeg', 0.7));
+        };
+    });
+}
+
 // ── Auto-refresh ──────────────────────────────────────────────────────────────
 function startRefresh() {
   fetchAll();
