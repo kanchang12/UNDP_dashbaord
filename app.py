@@ -25,6 +25,8 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 logging.basicConfig(level=logging.INFO)
 
 # ── Environment variables ──────────────────────────────────────────────────────
+from google import genai
+from google.genai import types
 
 SUPABASE_URL      = os.environ.get("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
@@ -32,10 +34,9 @@ GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-1.5-flash:generateContent"
-)
+from google import genai
+from google.genai import types
+client = genai.Client(api_key=GEMINI_API_KEY)
 STORAGE_BUCKET = "report-images"
 
 _rate_limit_store: Dict[str, List[datetime]] = defaultdict(list)
@@ -230,71 +231,43 @@ def _extract_json_from_gemini(response: dict) -> Optional[dict]:
 # ── STEP 1 — AI reads images and fills ALL UNDP fields ────────────────────────
 
 def step1_image_analysis(image_b64_list: List[str]) -> dict:
-    empty = {
-        "damage_level": "minimal",
-        "infrastructure_type": "other",
-        "infrastructure_name": "",
-        "crisis_type": "insignificant",
-        "has_debris": "attention_not_required",
-        "electricity_status": "attention_not_required",
-        "health_services_status": "attention_not_required",
-        "pressing_needs": [],
-        "location_description": "",
-        "debris_detected": False,
-        "confidence": 0.0,
-        "reasoning": "No images provided.",
-    }
-
     if not GEMINI_API_KEY or not image_b64_list:
-        return empty
-
-    prompt = """
-You are a UNDP crisis damage assessment AI. Analyse all provided images carefully.
-Fill in EVERY field below based strictly on what you can see in the images.
-Return ONLY a valid JSON object, no markdown, no explanation outside the JSON.
-
-{
-  "damage_level": "minimal | partial | complete",
-  "infrastructure_type": "residential | commercial | government | utility | transport | community | public | other",
-  "infrastructure_name": "name or description of the specific building or infrastructure visible, empty string if unclear",
-  "crisis_type": "earthquake | flood | tsunami | hurricane | wildfire | explosion | chemical | conflict | civil_unrest | insignificant",
-  "has_debris": "yes | no | attention_not_required",
-  "debris_detected": true or false,
-  "electricity_status": "no_damage | minor_damage | moderate_damage | severe_damage | destroyed | attention_not_required",
-  "health_services_status": "fully_functional | partially_functional | largely_disrupted | not_functioning | attention_not_required",
-  "pressing_needs": ["list", "any", "of", "these", "that", "are", "visible", "or", "implied"],
-  "location_description": "brief plain language description of what and where based on visible landmarks, street signs, environment",
-  "confidence": 0.0 to 1.0,
-  "reasoning": "one sentence explaining your damage assessment"
-}
-
-For pressing_needs, pick only from this exact list based on what the images imply:
-food_water, cash_assistance, healthcare, shelter, livelihoods, wash, infrastructure_restoration, psychosocial_support, authority_support, other
-
-Damage level definitions:
-- minimal: structurally sound, cosmetic damage only
-- partial: repairable, usable with caution
-- complete: structurally unsafe or destroyed
-"""
-
-    parts = [{"text": prompt}]
+        return {"damage_level": "minimal", "infrastructure_type": "other", "infrastructure_name": "", "crisis_type": "insignificant", "has_debris": "attention_not_required", "debris_detected": False, "electricity_status": "attention_not_required", "health_services_status": "attention_not_required", "pressing_needs": [], "location_description": "No images.", "confidence": 0.0, "reasoning": "No images."}
+    
+    prompt = """Analyze these images. Return ONLY JSON:
+    {
+      "damage_level": "minimal | partial | complete",
+      "infrastructure_type": "residential | commercial | government | utility | transport | community | public | other",
+      "infrastructure_name": "string",
+      "crisis_type": "earthquake | flood | tsunami | hurricane | wildfire | explosion | chemical | conflict | civil_unrest | insignificant",
+      "has_debris": "yes | no | attention_not_required",
+      "debris_detected": bool,
+      "electricity_status": "no_damage | minor_damage | moderate_damage | severe_damage | destroyed | attention_not_required",
+      "health_services_status": "fully_functional | partially_functional | largely_disrupted | not_functioning | attention_not_required",
+      "pressing_needs": ["food_water", "cash_assistance", "healthcare", "shelter", "livelihoods", "wash", "infrastructure_restoration", "psychosocial_support", "authority_support", "other"],
+      "location_description": "string",
+      "confidence": 0.0,
+      "reasoning": "string"
+    }"""
+    
+    parts = [prompt]
     for b64 in image_b64_list[:4]:
-        mime = _detect_mime(b64)
-        parts.append({"inline_data": {"mime_type": mime, "data": b64}})
-
-    payload = {"contents": [{"parts": parts}]}
-    response = _gemini_post(payload, timeout=45)
-
-    if response:
-        result = _extract_json_from_gemini(response)
-        if result:
-            if isinstance(result.get("pressing_needs"), str):
-                result["pressing_needs"] = [result["pressing_needs"]]
-            if not isinstance(result.get("pressing_needs"), list):
-                result["pressing_needs"] = []
-            return result
-
-    return {**empty, "reasoning": "AI could not analyse images — defaults applied."}
+        try:
+            parts.append(types.Part.from_bytes(data=base64.b64decode(b64), mime_type=_detect_mime(b64)))
+        except: continue
+        
+    try:
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=parts,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+        )
+        result = json.loads(response.text)
+        if not isinstance(result.get("pressing_needs"), list): result["pressing_needs"] = []
+        return result
+    except Exception as e:
+        logging.error(f"Gemini failure: {e}")
+        return {"damage_level": "minimal", "infrastructure_type": "other", "reasoning": "AI error."}
 
 
 # ── STEP 2 — Area signals ──────────────────────────────────────────────────────
