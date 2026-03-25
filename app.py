@@ -231,43 +231,71 @@ def _extract_json_from_gemini(response: dict) -> Optional[dict]:
 # ── STEP 1 — AI reads images and fills ALL UNDP fields ────────────────────────
 
 def step1_image_analysis(image_b64_list: List[str]) -> dict:
-    if not GEMINI_API_KEY or not image_b64_list:
-        return {"damage_level": "minimal", "infrastructure_type": "other", "infrastructure_name": "", "crisis_type": "insignificant", "has_debris": "attention_not_required", "debris_detected": False, "electricity_status": "attention_not_required", "health_services_status": "attention_not_required", "pressing_needs": [], "location_description": "No images.", "confidence": 0.0, "reasoning": "No images."}
-    
-    prompt = """Analyze these images. Return ONLY JSON:
+    if not image_b64_list:
+        return {"damage_level": "minimal", "infrastructure_type": "other", "reasoning": "No images provided."}
+
+    # FULL DETAILED PROMPT FOR UNDP COMPLIANCE
+    prompt = """
+    You are a UNDP crisis damage assessment AI. Analyse all provided images carefully.
+    Fill in EVERY field below based strictly on what you can see in the images.
+    Return ONLY a valid JSON object.
+
     {
       "damage_level": "minimal | partial | complete",
       "infrastructure_type": "residential | commercial | government | utility | transport | community | public | other",
-      "infrastructure_name": "string",
+      "infrastructure_name": "name or description of the specific building visible, empty string if unclear",
       "crisis_type": "earthquake | flood | tsunami | hurricane | wildfire | explosion | chemical | conflict | civil_unrest | insignificant",
       "has_debris": "yes | no | attention_not_required",
-      "debris_detected": bool,
+      "debris_detected": true,
       "electricity_status": "no_damage | minor_damage | moderate_damage | severe_damage | destroyed | attention_not_required",
       "health_services_status": "fully_functional | partially_functional | largely_disrupted | not_functioning | attention_not_required",
       "pressing_needs": ["food_water", "cash_assistance", "healthcare", "shelter", "livelihoods", "wash", "infrastructure_restoration", "psychosocial_support", "authority_support", "other"],
-      "location_description": "string",
+      "location_description": "brief description of environment/landmarks",
       "confidence": 0.0,
-      "reasoning": "string"
-    }"""
-    
+      "reasoning": "one sentence explaining your damage assessment"
+    }
+
+    Damage level definitions:
+    - minimal: structurally sound, cosmetic damage only
+    - partial: repairable, usable with caution
+    - complete: structurally unsafe or destroyed
+    """
+
     parts = [prompt]
     for b64 in image_b64_list[:4]:
         try:
             parts.append(types.Part.from_bytes(data=base64.b64decode(b64), mime_type=_detect_mime(b64)))
         except: continue
-        
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=parts,
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
-        )
-        result = json.loads(response.text)
-        if not isinstance(result.get("pressing_needs"), list): result["pressing_needs"] = []
-        return result
-    except Exception as e:
-        logging.error(f"Gemini failure: {e}")
-        return {"damage_level": "minimal", "infrastructure_type": "other", "reasoning": "AI error."}
+
+    # RETRY LOOP FOR 429 ERRORS
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.0-flash", 
+                contents=parts,
+                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+            )
+            
+            # JSON PARSING & LIST FIX
+            raw_data = json.loads(response.text)
+            # Fix 'list object has no attribute get'
+            result = raw_data[0] if isinstance(raw_data, list) else raw_data
+            
+            # Array Type Safety
+            p_needs = result.get("pressing_needs", [])
+            result["pressing_needs"] = p_needs if isinstance(p_needs, list) else [p_needs]
+            
+            return result
+
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                logging.warning(f"429 Rate Limit hit. Waiting {attempt + 1}s before retry...")
+                time.sleep(attempt + 1)
+                continue
+            logging.error(f"Gemini failure: {e}")
+            break
+
+    return {"damage_level": "minimal", "infrastructure_type": "other", "reasoning": "AI assessment failed after retries."}
 
 
 # ── STEP 2 — Area signals ──────────────────────────────────────────────────────
