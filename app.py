@@ -11,23 +11,22 @@
 # Run locally:
 #   pip install -r requirements.txt
 #   python app.py
-#
-# Database schema (run once in Supabase SQL editor):
-# See bottom of this file.
 
 import base64
-import io
 import json
 import logging
 import math
 import os
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Tuple, Union
 
 import requests
-from flask import Flask, request, Response
+from flask import Flask, request, Response, render_template
 
-app = Flask(__name__)
+# FIX 1 — explicit template and static folders so render_template works
+app = Flask(__name__, template_folder="templates", static_folder="static")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -39,12 +38,17 @@ GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
-
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
     "models/gemini-1.5-flash:generateContent"
 )
 STORAGE_BUCKET = "report-images"
+
+# FIX 7 — simple in-memory rate limit store (device_id -> list of timestamps)
+_rate_limit_store: Dict[str, List[datetime]] = defaultdict(list)
+RATE_LIMIT_MAX    = 10   # max submissions
+RATE_LIMIT_WINDOW = 60   # per N seconds
+
 
 # ── CORS helpers ───────────────────────────────────────────────────────────────
 
@@ -63,6 +67,25 @@ def options_response() -> Response:
     return Response("", status=204, headers=CORS_HEADERS)
 
 
+def is_rate_limited(device_id: str) -> bool:
+    """FIX 7 — reject if device submits more than RATE_LIMIT_MAX times in RATE_LIMIT_WINDOW seconds."""
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(seconds=RATE_LIMIT_WINDOW)
+    timestamps = _rate_limit_store[device_id]
+    timestamps[:] = [t for t in timestamps if t > window_start]
+    if len(timestamps) >= RATE_LIMIT_MAX:
+        return True
+    timestamps.append(now)
+    return False
+
+
+# ── Root route — serves dashboard ─────────────────────────────────────────────
+
+@app.route("/", methods=["GET"])
+def index():
+    return render_template("index.html")
+
+
 # ── Supabase REST helpers ──────────────────────────────────────────────────────
 
 def _sb_headers(content_type: str = "application/json") -> dict:
@@ -74,8 +97,7 @@ def _sb_headers(content_type: str = "application/json") -> dict:
     }
 
 
-def sb_insert(table: str, data: dict) -> dict | None:
-    """Insert a row and return the inserted record."""
+def sb_insert(table: str, data: dict) -> Optional[dict]:
     try:
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/{table}",
@@ -91,8 +113,7 @@ def sb_insert(table: str, data: dict) -> dict | None:
         return None
 
 
-def sb_select(table: str, params: dict | None = None, single: bool = False) -> list | dict | None:
-    """Select rows with optional PostgREST filter params."""
+def sb_select(table: str, params: Optional[dict] = None, single: bool = False) -> Union[List, Optional[dict]]:
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/{table}",
@@ -109,7 +130,6 @@ def sb_select(table: str, params: dict | None = None, single: bool = False) -> l
 
 
 def sb_update(table: str, match: dict, data: dict) -> None:
-    """Update rows matching the given equality filters."""
     try:
         params = {k: f"eq.{v}" for k, v in match.items()}
         requests.patch(
@@ -125,17 +145,37 @@ def sb_update(table: str, match: dict, data: dict) -> None:
 
 # ── Supabase Storage ───────────────────────────────────────────────────────────
 
-def upload_image_to_storage(image_b64: str, report_id: str, index: int) -> str | None:
-    """Upload a base64-encoded image to Supabase Storage and return the public URL."""
+def _detect_mime(image_b64: str) -> str:
+    """FIX 5 — detect actual image mime type from magic bytes, not assume JPEG."""
+    try:
+        header = base64.b64decode(image_b64[:16])
+        if header[:8] == b'\x89PNG\r\n\x1a\n':
+            return "image/png"
+        if header[:6] in (b'GIF87a', b'GIF89a'):
+            return "image/gif"
+        if header[:4] == b'RIFF' and header[8:12] == b'WEBP':
+            return "image/webp"
+    except Exception:
+        pass
+    return "image/jpeg"
+
+
+def _mime_to_ext(mime: str) -> str:
+    return {"image/png": "png", "image/gif": "gif", "image/webp": "webp"}.get(mime, "jpg")
+
+
+def upload_image_to_storage(image_b64: str, report_id: str, index: int) -> Optional[str]:
     try:
         image_bytes = base64.b64decode(image_b64)
-        filename = f"{report_id}/{index}.jpg"
+        mime = _detect_mime(image_b64)
+        ext = _mime_to_ext(mime)
+        filename = f"{report_id}/{index}.{ext}"
         r = requests.post(
             f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{filename}",
             headers={
                 "apikey": SUPABASE_ANON_KEY,
                 "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-                "Content-Type": "image/jpeg",
+                "Content-Type": mime,
             },
             data=image_bytes,
             timeout=20,
@@ -153,17 +193,16 @@ def upload_image_to_storage(image_b64: str, report_id: str, index: int) -> str |
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     R = 6_371_000
-    φ1, φ2 = math.radians(lat1), math.radians(lat2)
-    Δφ = math.radians(lat2 - lat1)
-    Δλ = math.radians(lng2 - lng1)
-    a = math.sin(Δφ / 2) ** 2 + math.cos(φ1) * math.cos(φ2) * math.sin(Δλ / 2) ** 2
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 # ── AI Pipeline ────────────────────────────────────────────────────────────────
 
-def _gemini_post(payload: dict, timeout: int = 20) -> dict | None:
-    """POST to Gemini REST endpoint."""
+def _gemini_post(payload: dict, timeout: int = 20) -> Optional[dict]:
     try:
         r = requests.post(
             GEMINI_URL,
@@ -178,8 +217,7 @@ def _gemini_post(payload: dict, timeout: int = 20) -> dict | None:
         return None
 
 
-def _extract_json_from_gemini(response: dict) -> dict | None:
-    """Pull the first JSON object out of a Gemini text response."""
+def _extract_json_from_gemini(response: dict) -> Optional[dict]:
     try:
         text = response["candidates"][0]["content"]["parts"][0]["text"]
         start = text.find("{")
@@ -191,11 +229,10 @@ def _extract_json_from_gemini(response: dict) -> dict | None:
     return None
 
 
-def step1_image_analysis(image_b64_list: list[str]) -> dict:
+def step1_image_analysis(image_b64_list: List[str]) -> dict:
     """
     Step 1 — Gemini Vision API.
-    Analyses all submitted images together and returns a structured
-    damage assessment.
+    Analyses all submitted images together and returns a structured damage assessment.
     """
     if not GEMINI_API_KEY or not image_b64_list:
         return {
@@ -225,9 +262,10 @@ def step1_image_analysis(image_b64_list: list[str]) -> dict:
     ]
 
     for b64 in image_b64_list[:4]:
+        mime = _detect_mime(b64)
         parts.append({
             "inline_data": {
-                "mime_type": "image/jpeg",
+                "mime_type": mime,
                 "data": b64,
             }
         })
@@ -248,22 +286,27 @@ def step1_image_analysis(image_b64_list: list[str]) -> dict:
     }
 
 
-def step2_area_signals(lat: float | None, lng: float | None) -> dict:
+def step2_area_signals(lat: Optional[float], lng: Optional[float]) -> dict:
     """
     Step 2 — Area signal aggregation.
-    Queries all reports within 500m submitted in the last 2 hours.
+    FIX 4 — queries BOTH sides of the bounding box (min AND max lat/lng).
     """
     if lat is None or lng is None:
-        return {"nearby_count": 0, "avg_damage": None, "dominant_crisis": None}
+        return {"nearby_count": 0, "avg_damage": None, "dominant_crisis": None, "density_per_km2": 0}
 
     two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     lat_delta = 0.0045  # ~500m
     lng_delta = lat_delta / max(math.cos(math.radians(lat)), 0.01)
 
+    # FIX 4 — use PostgREST and() to apply both gte and lte on same columns
     rows = sb_select("reports", params={
-        "lat": f"gte.{lat - lat_delta}",
-        "lng": f"gte.{lng - lng_delta}",
-        "submitted_at": f"gte.{two_hours_ago}",
+        "and": (
+            f"(lat.gte.{lat - lat_delta},"
+            f"lat.lte.{lat + lat_delta},"
+            f"lng.gte.{lng - lng_delta},"
+            f"lng.lte.{lng + lng_delta},"
+            f"submitted_at.gte.{two_hours_ago})"
+        ),
         "select": "lat,lng,damage_level,crisis_type",
         "limit": "200",
     }) or []
@@ -275,18 +318,18 @@ def step2_area_signals(lat: float | None, lng: float | None) -> dict:
     ]
 
     if not nearby:
-        return {"nearby_count": 0, "avg_damage": None, "dominant_crisis": None}
+        return {"nearby_count": 0, "avg_damage": None, "dominant_crisis": None, "density_per_km2": 0}
 
     damage_scores = {"minimal": 1, "partial": 2, "complete": 3}
     levels = [damage_scores.get(r.get("damage_level", ""), 0) for r in nearby if r.get("damage_level")]
     avg_score = sum(levels) / len(levels) if levels else 0
 
-    crisis_counts: dict[str, int] = {}
+    crisis_counts: Dict[str, int] = {}
     for r in nearby:
         ct = r.get("crisis_type", "")
         if ct:
             crisis_counts[ct] = crisis_counts.get(ct, 0) + 1
-    dominant = max(crisis_counts, key=crisis_counts.get) if crisis_counts else None
+    dominant = max(crisis_counts, key=lambda k: crisis_counts[k]) if crisis_counts else None
 
     avg_damage = (
         "minimal" if avg_score < 1.5
@@ -310,7 +353,7 @@ def step3_combined_assessment(
     """
     Step 3 — Combined AI decision.
     Sends image analysis + area signals + form data to OpenAI GPT-4o,
-    with Gemini as fallback, and returns a final prioritised assessment.
+    with Gemini as fallback.
     """
     system_prompt = (
         "You are a UNDP crisis assessment AI. "
@@ -334,7 +377,7 @@ def step3_combined_assessment(
         '"reasoning": "two sentences max"}'
     )
 
-    # OpenAI GPT-4o (primary).
+    # OpenAI GPT-4o (primary)
     if OPENAI_API_KEY:
         try:
             r = requests.post(
@@ -362,12 +405,10 @@ def step3_combined_assessment(
         except Exception as e:
             logging.warning(f"OpenAI step3 failed, falling back to Gemini: {e}")
 
-    # Gemini fallback.
+    # Gemini fallback
     payload = {
         "contents": [{
-            "parts": [
-                {"text": f"System: {system_prompt}\n\nUser: {user_content}"}
-            ]
+            "parts": [{"text": f"System: {system_prompt}\n\nUser: {user_content}"}]
         }]
     }
     response = _gemini_post(payload, timeout=20)
@@ -376,7 +417,7 @@ def step3_combined_assessment(
         if result:
             return result
 
-    # Hard fallback — use reported data + image analysis as ground truth.
+    # Hard fallback — use reported data + image analysis
     reported = form_data.get("damage_level", "unknown")
     ai_damage = image_analysis.get("damage_level", reported)
     final = ai_damage if ai_damage != "unknown" else reported
@@ -392,14 +433,17 @@ def step3_combined_assessment(
 
 
 def step4_duplicate_detection(
-    building_footprint_id: str | None,
+    building_footprint_id: Optional[str],
     device_id: str,
     report_id: str,
-) -> tuple[bool, str | None]:
+) -> Tuple[bool, Optional[str]]:
     """
     Step 4 — Duplicate detection.
+    FIX 3 — guard against None building_footprint_id corrupting all records.
+    FIX 8 — version_group_id is assigned when a duplicate IS found, not when it is not.
     Returns (is_duplicate_flagged, version_group_id).
     """
+    # FIX 3 — never query or update with an empty building_footprint_id
     if not building_footprint_id:
         return False, None
 
@@ -414,6 +458,7 @@ def step4_duplicate_detection(
     if not existing:
         return False, None
 
+    # FIX 8 — version group only assigned when existing reports found for same building
     version_group_id = None
     for row in existing:
         if row.get("version_group_id"):
@@ -462,23 +507,33 @@ def submit_report():
     if not body:
         return cors_response(json.dumps({"error": "Invalid JSON"}), 400)
 
-    required = ["infrastructure_type", "damage_level", "crisis_type",
-                "has_debris", "electricity_status", "health_services_status",
-                "pressing_needs", "anonymous_device_id"]
+    # FIX 7 — rate limit check before any processing
+    device_id = body.get("anonymous_device_id", "")
+    if not device_id:
+        return cors_response(json.dumps({"error": "anonymous_device_id required"}), 400)
+    if is_rate_limited(device_id):
+        return cors_response(
+            json.dumps({"error": "Rate limit exceeded. Please wait before submitting again."}), 429
+        )
+
+    required = [
+        "infrastructure_type", "damage_level", "crisis_type",
+        "has_debris", "electricity_status", "health_services_status",
+        "pressing_needs", "anonymous_device_id",
+    ]
     missing = [f for f in required if not body.get(f)]
     if missing:
         return cors_response(
             json.dumps({"error": f"Missing required fields: {missing}"}), 400
         )
 
-    report_id = str(uuid.uuid4())
+    report_id    = str(uuid.uuid4())
     submitted_at = body.get("submitted_at") or datetime.now(timezone.utc).isoformat()
-    lat = body.get("lat")
-    lng = body.get("lng")
-    device_id = body.get("anonymous_device_id", "")
+    lat          = body.get("lat")
+    lng          = body.get("lng")
 
-    images_b64: list[str] = body.get("images_b64", [])
-    image_urls: list[str] = []
+    images_b64: List[str] = body.get("images_b64", [])
+    image_urls: List[str] = []
     for i, b64 in enumerate(images_b64[:4]):
         url = upload_image_to_storage(b64, report_id, i)
         if url:
@@ -503,52 +558,53 @@ def submit_report():
         pressing_needs = [pressing_needs]
 
     record = {
-        "id": report_id,
-        "submitted_at": submitted_at,
-        "lat": float(lat) if lat is not None else None,
-        "lng": float(lng) if lng is not None else None,
-        "building_footprint_id": body.get("building_footprint_id"),
-        "location_description": body.get("location_description"),
-        "infrastructure_type": body.get("infrastructure_type"),
+        "id":                        report_id,
+        "submitted_at":              submitted_at,
+        "lat":                       float(lat) if lat is not None else None,
+        "lng":                       float(lng) if lng is not None else None,
+        "building_footprint_id":     body.get("building_footprint_id"),
+        "location_description":      body.get("location_description"),
+        "infrastructure_type":       body.get("infrastructure_type"),
         "infrastructure_type_other": body.get("infrastructure_type_other"),
-        "infrastructure_name": body.get("infrastructure_name"),
-        "damage_level": body.get("damage_level"),
-        "crisis_type": body.get("crisis_type"),
-        "has_debris": body.get("has_debris"),
-        "electricity_status": body.get("electricity_status"),
-        "health_services_status": body.get("health_services_status"),
-        "pressing_needs": pressing_needs,
-        "image_urls": image_urls,
-        "ai_damage_classification": combined.get("final_damage_level"),
-        "ai_confidence_score": combined.get("confidence"),
-        "ai_reasoning": combined.get("reasoning"),
-        "ai_recommended_action": combined.get("recommended_action"),
-        "ai_priority_score": combined.get("priority_score"),
-        "area_signal_score": area_score,
-        "is_duplicate_flagged": is_dup,
-        "version_group_id": vg_id,
-        "language_submitted": body.get("language_submitted", "en"),
-        "anonymous_device_id": device_id,
+        "infrastructure_name":       body.get("infrastructure_name"),
+        "damage_level":              body.get("damage_level"),
+        "crisis_type":               body.get("crisis_type"),
+        "has_debris":                body.get("has_debris"),
+        "electricity_status":        body.get("electricity_status"),
+        "health_services_status":    body.get("health_services_status"),
+        "pressing_needs":            pressing_needs,
+        "image_urls":                image_urls,
+        "ai_damage_classification":  combined.get("final_damage_level"),
+        "ai_confidence_score":       combined.get("confidence"),
+        "ai_reasoning":              combined.get("reasoning"),
+        "ai_recommended_action":     combined.get("recommended_action"),
+        "ai_priority_score":         combined.get("priority_score"),
+        "area_signal_score":         area_score,
+        "is_duplicate_flagged":      is_dup,
+        "version_group_id":          vg_id,
+        "language_submitted":        body.get("language_submitted", "en"),
+        "anonymous_device_id":       device_id,
     }
 
     sb_insert("reports", record)
 
-    if vg_id and not is_dup:
+    # FIX 8 — only propagate version_group when duplicates confirmed AND footprint exists
+    if vg_id and is_dup and body.get("building_footprint_id"):
         sb_update(
             "reports",
-            {"building_footprint_id": body.get("building_footprint_id", "")},
+            {"building_footprint_id": body.get("building_footprint_id")},
             {"version_group_id": vg_id},
         )
 
     return cors_response(json.dumps({
-        "submission_id": report_id,
-        "ai_classification": combined.get("final_damage_level"),
-        "ai_priority_score": combined.get("priority_score"),
-        "ai_reasoning": combined.get("reasoning"),
+        "submission_id":         report_id,
+        "ai_classification":     combined.get("final_damage_level"),
+        "ai_priority_score":     combined.get("priority_score"),
+        "ai_reasoning":          combined.get("reasoning"),
         "ai_recommended_action": combined.get("recommended_action"),
-        "area_signals": area_signals,
-        "is_duplicate_flagged": is_dup,
-        "image_urls": image_urls,
+        "area_signals":          area_signals,
+        "is_duplicate_flagged":  is_dup,
+        "image_urls":            image_urls,
     }), 201)
 
 
@@ -565,21 +621,23 @@ def get_reports():
         return options_response()
 
     p = request.args
-    params: dict = {}
+    filters = []
 
     if p.get("crisis_type"):
-        params["crisis_type"] = f"eq.{p['crisis_type']}"
+        filters.append(f"crisis_type.eq.{p['crisis_type']}")
     if p.get("damage_level"):
-        params["damage_level"] = f"eq.{p['damage_level']}"
+        filters.append(f"damage_level.eq.{p['damage_level']}")
     if p.get("infrastructure_type"):
-        params["infrastructure_type"] = f"eq.{p['infrastructure_type']}"
+        filters.append(f"infrastructure_type.eq.{p['infrastructure_type']}")
+    # FIX 1 — both date_from and date_to applied via and(), neither overwrites the other
     if p.get("date_from"):
-        params["submitted_at"] = f"gte.{p['date_from']}"
+        filters.append(f"submitted_at.gte.{p['date_from']}")
     if p.get("date_to"):
-        params["submitted_at"] = f"lte.{p['date_to']}"
+        filters.append(f"submitted_at.lte.{p['date_to']}")
 
-    params["order"] = "submitted_at.desc"
-    params["limit"] = "2000"
+    params: dict = {"order": "submitted_at.desc", "limit": "2000"}
+    if filters:
+        params["and"] = f"({','.join(filters)})"
 
     rows = sb_select("reports", params=params) or []
 
@@ -614,13 +672,13 @@ def dashboard_stats():
 
     rows = sb_select("reports", params={"order": "submitted_at.desc", "limit": "5000"}) or []
 
-    total = len(rows)
+    total         = len(rows)
     damage_counts = _count_by(rows, "damage_level")
     infra_counts  = _count_by(rows, "infrastructure_type")
     crisis_counts = _count_by(rows, "crisis_type")
 
     now = datetime.now(timezone.utc)
-    buckets: dict[str, int] = {}
+    buckets: Dict[str, int] = {}
     for h in range(24):
         label = (now - timedelta(hours=23 - h)).strftime("%H:00")
         buckets[label] = 0
@@ -649,27 +707,27 @@ def dashboard_stats():
     )[:10]
     priority_queue = [
         {
-            "id": r.get("id"),
-            "lat": r.get("lat"),
-            "lng": r.get("lng"),
-            "infrastructure_type": r.get("infrastructure_type"),
-            "damage_level": r.get("damage_level"),
-            "ai_priority_score": r.get("ai_priority_score"),
+            "id":                    r.get("id"),
+            "lat":                   r.get("lat"),
+            "lng":                   r.get("lng"),
+            "infrastructure_type":   r.get("infrastructure_type"),
+            "damage_level":          r.get("damage_level"),
+            "ai_priority_score":     r.get("ai_priority_score"),
             "ai_recommended_action": r.get("ai_recommended_action"),
-            "submitted_at": r.get("submitted_at"),
+            "submitted_at":          r.get("submitted_at"),
         }
         for r in priority_rows
     ]
 
     return cors_response(json.dumps({
-        "total": total,
-        "damage_counts": damage_counts,
-        "infra_counts": infra_counts,
-        "crisis_counts": crisis_counts,
-        "timeline_24h": [{"hour": k, "count": v} for k, v in buckets.items()],
+        "total":          total,
+        "damage_counts":  damage_counts,
+        "infra_counts":   infra_counts,
+        "crisis_counts":  crisis_counts,
+        "timeline_24h":   [{"hour": k, "count": v} for k, v in buckets.items()],
         "heatmap_points": heatmap,
         "priority_queue": priority_queue,
-        "last_updated": now.isoformat(),
+        "last_updated":   now.isoformat(),
     }))
 
 
@@ -683,26 +741,31 @@ def export_data():
     if request.method == "OPTIONS":
         return options_response()
 
-    body = request.get_json(silent=True) or {}
-    filters = body.get("filters", {})
-    fmt = body.get("format", "csv")
+    body       = request.get_json(silent=True) or {}
+    filters_in = body.get("filters", {})
+    fmt        = body.get("format", "csv")
+
+    filters = []
+    if filters_in.get("crisis_type"):
+        filters.append(f"crisis_type.eq.{filters_in['crisis_type']}")
+    if filters_in.get("damage_level"):
+        filters.append(f"damage_level.eq.{filters_in['damage_level']}")
+    if filters_in.get("infrastructure_type"):
+        filters.append(f"infrastructure_type.eq.{filters_in['infrastructure_type']}")
+    # FIX 1 — date range applied correctly via and()
+    if filters_in.get("date_from"):
+        filters.append(f"submitted_at.gte.{filters_in['date_from']}")
+    if filters_in.get("date_to"):
+        filters.append(f"submitted_at.lte.{filters_in['date_to']}")
 
     params: dict = {"order": "submitted_at.desc", "limit": "10000"}
-    if filters.get("crisis_type"):
-        params["crisis_type"] = f"eq.{filters['crisis_type']}"
-    if filters.get("damage_level"):
-        params["damage_level"] = f"eq.{filters['damage_level']}"
-    if filters.get("infrastructure_type"):
-        params["infrastructure_type"] = f"eq.{filters['infrastructure_type']}"
-    if filters.get("date_from"):
-        params["submitted_at"] = f"gte.{filters['date_from']}"
-    if filters.get("date_to"):
-        params["submitted_at"] = f"lte.{filters['date_to']}"
+    if filters:
+        params["and"] = f"({','.join(filters)})"
 
     rows = sb_select("reports", params=params) or []
 
     if fmt == "geojson":
-        resp = Response(
+        return Response(
             json.dumps(_rows_to_geojson(rows), indent=2),
             status=200,
             mimetype="application/geo+json",
@@ -711,7 +774,6 @@ def export_data():
                 "Content-Disposition": "attachment; filename=crisismap_export.geojson",
             },
         )
-        return resp
 
     return _rows_to_csv_response(rows)
 
@@ -731,18 +793,21 @@ def reporter_alert():
         return cors_response(json.dumps({"error": "Invalid JSON"}), 400)
 
     record = {
-        "id": str(uuid.uuid4()),
-        "alert_type": body.get("alert_type", "REPORTER_SAFETY_ALERT"),
-        "anonymous_device_id": body.get("anonymous_device_id", "unknown"),
-        "coordinator_id": body.get("coordinator_id", ""),
-        "lat": body.get("lat"),
-        "lng": body.get("lng"),
-        "accuracy_metres": body.get("accuracy_metres"),
-        "triggered_at": body.get("triggered_at") or datetime.now(timezone.utc).isoformat(),
+        "id":                   str(uuid.uuid4()),
+        "alert_type":           body.get("alert_type", "REPORTER_SAFETY_ALERT"),
+        "anonymous_device_id":  body.get("anonymous_device_id", "unknown"),
+        "coordinator_id":       body.get("coordinator_id", ""),
+        "lat":                  body.get("lat"),
+        "lng":                  body.get("lng"),
+        "accuracy_metres":      body.get("accuracy_metres"),
+        "triggered_at":         body.get("triggered_at") or datetime.now(timezone.utc).isoformat(),
     }
 
     sb_insert("reporter_alerts", record)
-    logging.info(f"Reporter safety alert from {record['anonymous_device_id']} to coordinator {record['coordinator_id']}")
+    logging.info(
+        f"Reporter safety alert from {record['anonymous_device_id']} "
+        f"to coordinator {record['coordinator_id']}"
+    )
 
     return cors_response(json.dumps({"status": "received"}), 201)
 
@@ -761,28 +826,28 @@ def _rows_to_geojson(rows: list) -> dict:
                 "coordinates": [float(r["lng"]), float(r["lat"])],
             },
             "properties": {
-                "id": r.get("id"),
-                "submitted_at": r.get("submitted_at"),
-                "infrastructure_type": r.get("infrastructure_type"),
-                "infrastructure_name": r.get("infrastructure_name"),
-                "damage_level": r.get("damage_level"),
-                "crisis_type": r.get("crisis_type"),
-                "has_debris": r.get("has_debris"),
-                "electricity_status": r.get("electricity_status"),
-                "health_services_status": r.get("health_services_status"),
-                "pressing_needs": r.get("pressing_needs", []),
-                "location_description": r.get("location_description"),
-                "building_footprint_id": r.get("building_footprint_id"),
-                "image_urls": r.get("image_urls", []),
+                "id":                       r.get("id"),
+                "submitted_at":             r.get("submitted_at"),
+                "infrastructure_type":      r.get("infrastructure_type"),
+                "infrastructure_name":      r.get("infrastructure_name"),
+                "damage_level":             r.get("damage_level"),
+                "crisis_type":              r.get("crisis_type"),
+                "has_debris":               r.get("has_debris"),
+                "electricity_status":       r.get("electricity_status"),
+                "health_services_status":   r.get("health_services_status"),
+                "pressing_needs":           r.get("pressing_needs", []),
+                "location_description":     r.get("location_description"),
+                "building_footprint_id":    r.get("building_footprint_id"),
+                "image_urls":               r.get("image_urls", []),
                 "ai_damage_classification": r.get("ai_damage_classification"),
-                "ai_confidence_score": r.get("ai_confidence_score"),
-                "ai_reasoning": r.get("ai_reasoning"),
-                "ai_recommended_action": r.get("ai_recommended_action"),
-                "ai_priority_score": r.get("ai_priority_score"),
-                "area_signal_score": r.get("area_signal_score"),
-                "is_duplicate_flagged": r.get("is_duplicate_flagged"),
-                "version_group_id": r.get("version_group_id"),
-                "language_submitted": r.get("language_submitted"),
+                "ai_confidence_score":      r.get("ai_confidence_score"),
+                "ai_reasoning":             r.get("ai_reasoning"),
+                "ai_recommended_action":    r.get("ai_recommended_action"),
+                "ai_priority_score":        r.get("ai_priority_score"),
+                "area_signal_score":        r.get("area_signal_score"),
+                "is_duplicate_flagged":     r.get("is_duplicate_flagged"),
+                "version_group_id":         r.get("version_group_id"),
+                "language_submitted":       r.get("language_submitted"),
             },
         })
     return {"type": "FeatureCollection", "features": features}
@@ -812,10 +877,13 @@ def _rows_to_csv_response(rows: list) -> Response:
             return f'"{s}"' if ("," in s or "\n" in s or '"' in s) else s
         lines.append(",".join(_cell(r.get(f)) for f in _CSV_FIELDS))
 
+    # FIX 6 — UTF-8 BOM so Excel correctly renders Arabic, Chinese, and other non-Latin scripts
+    csv_bytes = ("\ufeff" + "\n".join(lines)).encode("utf-8")
+
     return Response(
-        "\n".join(lines),
+        csv_bytes,
         status=200,
-        mimetype="text/csv",
+        mimetype="text/csv; charset=utf-8",
         headers={
             **CORS_HEADERS,
             "Content-Disposition": "attachment; filename=crisismap_export.csv",
@@ -823,87 +891,13 @@ def _rows_to_csv_response(rows: list) -> Response:
     )
 
 
-def _count_by(rows: list, field: str) -> dict:
-    counts: dict[str, int] = {}
+def _count_by(rows: list, field: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
     for r in rows:
         val = r.get(field, "unknown") or "unknown"
         counts[val] = counts.get(val, 0) + 1
     return counts
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DATABASE SCHEMA — Run once in Supabase SQL Editor
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# -- Enable UUID extension
-# CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-#
-# -- Main reports table
-# CREATE TABLE IF NOT EXISTS reports (
-#   id                      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-#   submitted_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-#   lat                     FLOAT8,
-#   lng                     FLOAT8,
-#   building_footprint_id   TEXT,
-#   location_description    TEXT,
-#   infrastructure_type     TEXT NOT NULL,
-#   infrastructure_type_other TEXT,
-#   infrastructure_name     TEXT,
-#   damage_level            TEXT NOT NULL CHECK (damage_level IN ('minimal','partial','complete')),
-#   crisis_type             TEXT NOT NULL,
-#   has_debris              TEXT,
-#   electricity_status      TEXT,
-#   health_services_status  TEXT,
-#   pressing_needs          TEXT[] DEFAULT '{}',
-#   image_urls              TEXT[] DEFAULT '{}',
-#   ai_damage_classification TEXT,
-#   ai_confidence_score     FLOAT4,
-#   ai_reasoning            TEXT,
-#   ai_recommended_action   TEXT,
-#   ai_priority_score       FLOAT4,
-#   area_signal_score       FLOAT4,
-#   is_duplicate_flagged    BOOLEAN DEFAULT FALSE,
-#   version_group_id        UUID,
-#   language_submitted      TEXT DEFAULT 'en',
-#   anonymous_device_id     TEXT NOT NULL
-# );
-#
-# -- Reporter safety alerts (no PII)
-# CREATE TABLE IF NOT EXISTS reporter_alerts (
-#   id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-#   alert_type           TEXT DEFAULT 'REPORTER_SAFETY_ALERT',
-#   anonymous_device_id  TEXT NOT NULL,
-#   coordinator_id       TEXT,
-#   lat                  FLOAT8,
-#   lng                  FLOAT8,
-#   accuracy_metres      FLOAT4,
-#   triggered_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
-# );
-#
-# -- Indexes
-# CREATE INDEX IF NOT EXISTS idx_reports_lat_lng ON reports (lat, lng);
-# CREATE INDEX IF NOT EXISTS idx_reports_submitted ON reports (submitted_at DESC);
-# CREATE INDEX IF NOT EXISTS idx_reports_damage ON reports (damage_level);
-# CREATE INDEX IF NOT EXISTS idx_reports_building ON reports (building_footprint_id);
-#
-# -- Row Level Security
-# ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
-# CREATE POLICY "anon_insert" ON reports FOR INSERT TO anon WITH CHECK (true);
-# CREATE POLICY "anon_select" ON reports FOR SELECT TO anon USING (true);
-#
-# ALTER TABLE reporter_alerts ENABLE ROW LEVEL SECURITY;
-# CREATE POLICY "anon_insert_alerts" ON reporter_alerts FOR INSERT TO anon WITH CHECK (true);
-#
-# -- Storage bucket for report images
-# INSERT INTO storage.buckets (id, name, public)
-#   VALUES ('report-images', 'report-images', true)
-#   ON CONFLICT DO NOTHING;
-#
-# CREATE POLICY "anon_upload" ON storage.objects FOR INSERT TO anon
-#   WITH CHECK (bucket_id = 'report-images');
-# CREATE POLICY "public_read" ON storage.objects FOR SELECT TO anon
-#   USING (bucket_id = 'report-images');
-# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
