@@ -377,7 +377,7 @@ html, body { height:100%; overflow:hidden; background:var(--bg); color:var(--tex
 'use strict';
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const API_BASE = (window.API_BASE_URL || 'https://your-azure-function-app.azurewebsites.net/api').replace(/\/$/, '');
+const API_BASE = (window.API_BASE_URL || '/api').replace(/\/$/, '');
 const REFRESH_MS = 30_000;
 
 // ── i18n ──────────────────────────────────────────────────────────────────────
