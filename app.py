@@ -6,11 +6,6 @@
 #   SUPABASE_ANON_KEY   — Supabase anon or service_role key
 #   GEMINI_API_KEY      — Google Gemini API key
 #   OPENAI_API_KEY      — OpenAI API key (optional, GPT-4o fallback)
-#
-# Submit flow:
-#   Flutter sends: anonymous_device_id + lat + lng + up to 4 base64 images
-#   Backend reads images with Gemini Vision and fills ALL UNDP fields automatically
-#   No form filling required from the user
 
 import base64
 import json
@@ -43,7 +38,6 @@ GEMINI_URL = (
 )
 STORAGE_BUCKET = "report-images"
 
-# Rate limiting
 _rate_limit_store: Dict[str, List[datetime]] = defaultdict(list)
 RATE_LIMIT_MAX    = 10
 RATE_LIMIT_WINDOW = 60
@@ -74,6 +68,14 @@ def is_rate_limited(device_id: str) -> bool:
         return True
     timestamps.append(now)
     return False
+
+
+def get_body():
+    """Accept JSON from both GET (query string) and POST (body)."""
+    if request.method == "POST":
+        return request.get_json(silent=True) or {}
+    else:
+        return dict(request.args)
 
 
 # ── Root ───────────────────────────────────────────────────────────────────────
@@ -228,10 +230,6 @@ def _extract_json_from_gemini(response: dict) -> Optional[dict]:
 # ── STEP 1 — AI reads images and fills ALL UNDP fields ────────────────────────
 
 def step1_image_analysis(image_b64_list: List[str]) -> dict:
-    """
-    Gemini Vision reads up to 4 images and fills every UNDP required field.
-    The user sends only photos + GPS. This function does the form filling.
-    """
     empty = {
         "damage_level": "partial",
         "infrastructure_type": "other",
@@ -275,19 +273,14 @@ food_water, cash_assistance, healthcare, shelter, livelihoods, wash, infrastruct
 
 Damage level definitions:
 - minimal: structurally sound, cosmetic damage only
-- partial: repairable, usable with caution  
+- partial: repairable, usable with caution
 - complete: structurally unsafe or destroyed
 """
 
     parts = [{"text": prompt}]
     for b64 in image_b64_list[:4]:
         mime = _detect_mime(b64)
-        parts.append({
-            "inline_data": {
-                "mime_type": mime,
-                "data": b64,
-            }
-        })
+        parts.append({"inline_data": {"mime_type": mime, "data": b64}})
 
     payload = {"contents": [{"parts": parts}]}
     response = _gemini_post(payload, timeout=45)
@@ -295,14 +288,12 @@ Damage level definitions:
     if response:
         result = _extract_json_from_gemini(response)
         if result:
-            # Ensure pressing_needs is always a list
             if isinstance(result.get("pressing_needs"), str):
                 result["pressing_needs"] = [result["pressing_needs"]]
             if not isinstance(result.get("pressing_needs"), list):
                 result["pressing_needs"] = []
             return result
 
-    logging.warning("Gemini image analysis returned no parseable result — using defaults")
     return {**empty, "reasoning": "AI could not analyse images — defaults applied."}
 
 
@@ -364,10 +355,7 @@ def step2_area_signals(lat: Optional[float], lng: Optional[float]) -> dict:
 
 # ── STEP 3 — Combined assessment ───────────────────────────────────────────────
 
-def step3_combined_assessment(
-    image_analysis: dict,
-    area_signals: dict,
-) -> dict:
+def step3_combined_assessment(image_analysis: dict, area_signals: dict) -> dict:
     system_prompt = (
         "You are a UNDP crisis assessment AI. "
         "Given image analysis and surrounding area signals, "
@@ -377,22 +365,16 @@ def step3_combined_assessment(
     user_content = (
         f"Image analysis: {json.dumps(image_analysis)}\n"
         f"Area signals (500m radius, last 2h): {json.dumps(area_signals)}\n\n"
-        "Return JSON: "
-        '{"final_damage_level": "minimal|partial|complete", '
-        '"priority_score": 0-100, '
-        '"confidence": 0.0-1.0, '
-        '"recommended_action": "one sentence for responders", '
-        '"reasoning": "two sentences max"}'
+        'Return JSON: {"final_damage_level": "minimal|partial|complete", '
+        '"priority_score": 0-100, "confidence": 0.0-1.0, '
+        '"recommended_action": "one sentence for responders", "reasoning": "two sentences max"}'
     )
 
     if OPENAI_API_KEY:
         try:
             r = requests.post(
                 OPENAI_URL,
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
                 json={
                     "model": "gpt-4o",
                     "messages": [
@@ -412,11 +394,7 @@ def step3_combined_assessment(
         except Exception as e:
             logging.warning(f"OpenAI step3 failed, falling back to Gemini: {e}")
 
-    payload = {
-        "contents": [{
-            "parts": [{"text": f"System: {system_prompt}\n\nUser: {user_content}"}]
-        }]
-    }
+    payload = {"contents": [{"parts": [{"text": f"System: {system_prompt}\n\nUser: {user_content}"}]}]}
     response = _gemini_post(payload, timeout=20)
     if response:
         result = _extract_json_from_gemini(response)
@@ -486,70 +464,54 @@ def compute_area_signal_score(area_signals: dict, combined: dict) -> float:
 
 # ── ENDPOINTS ──────────────────────────────────────────────────────────────────
 
-@app.route("/api/submit-report", methods=["POST", "OPTIONS"])
+@app.route("/api/submit-report", methods=["GET", "POST", "OPTIONS"])
 def submit_report():
-    """
-    POST /api/submit-report
-
-    Flutter sends ONLY:
-      - anonymous_device_id  (required)
-      - lat                  (optional but preferred)
-      - lng                  (optional but preferred)
-      - images_b64           (list of up to 4 base64 images)
-      - language_submitted   (optional, default 'en')
-      - building_footprint_id (optional)
-
-    Gemini reads the images and fills ALL UNDP fields automatically.
-    Returns the AI-filled form data so Flutter can display it to the user.
-    User can then optionally correct via PATCH /api/confirm-report.
-    """
     if request.method == "OPTIONS":
         return options_response()
 
-    body = request.get_json(silent=True)
+    body = get_body()
     if not body:
-        return cors_response(json.dumps({"error": "Invalid JSON"}), 400)
+        return cors_response(json.dumps({"error": "Invalid request"}), 400)
 
     device_id = body.get("anonymous_device_id", "")
     if not device_id:
         return cors_response(json.dumps({"error": "anonymous_device_id required"}), 400)
 
     if is_rate_limited(device_id):
-        return cors_response(
-            json.dumps({"error": "Rate limit exceeded. Please wait before submitting again."}), 429
-        )
+        return cors_response(json.dumps({"error": "Rate limit exceeded."}), 429)
 
     report_id    = str(uuid.uuid4())
     submitted_at = datetime.now(timezone.utc).isoformat()
     lat          = body.get("lat")
     lng          = body.get("lng")
 
-    # Upload images to storage first
     images_b64: List[str] = body.get("images_b64", [])
+    if isinstance(images_b64, str):
+        images_b64 = [images_b64]
+
     image_urls: List[str] = []
     for i, b64 in enumerate(images_b64[:4]):
         url = upload_image_to_storage(b64, report_id, i)
         if url:
             image_urls.append(url)
 
-    # Step 1 — AI reads images and fills every UNDP field
-    image_analysis = step1_image_analysis(images_b64[:4] if images_b64 else [])
+    if not image_urls:
+        image_urls = body.get("image_urls", [])
+        if isinstance(image_urls, str):
+            image_urls = [image_urls]
 
-    # Step 2 — area signals from nearby reports
-    area_signals = step2_area_signals(
+    image_analysis = step1_image_analysis(images_b64[:4] if images_b64 else [])
+    area_signals   = step2_area_signals(
         float(lat) if lat is not None else None,
         float(lng) if lng is not None else None,
     )
+    combined       = step3_combined_assessment(image_analysis, area_signals)
+    is_dup, vg_id  = step4_duplicate_detection(body.get("building_footprint_id"), device_id, report_id)
+    area_score     = compute_area_signal_score(area_signals, combined)
 
-    # Step 3 — combined priority assessment
-    combined = step3_combined_assessment(image_analysis, area_signals)
-
-    # Step 4 — duplicate detection
-    is_dup, vg_id = step4_duplicate_detection(
-        body.get("building_footprint_id"), device_id, report_id
-    )
-
-    area_score = compute_area_signal_score(area_signals, combined)
+    pressing_needs = image_analysis.get("pressing_needs", [])
+    if isinstance(pressing_needs, str):
+        pressing_needs = [pressing_needs]
 
     record = {
         "id":                        report_id,
@@ -566,7 +528,7 @@ def submit_report():
         "has_debris":                image_analysis.get("has_debris", "unknown"),
         "electricity_status":        image_analysis.get("electricity_status", "unknown"),
         "health_services_status":    image_analysis.get("health_services_status", "unknown"),
-        "pressing_needs":            image_analysis.get("pressing_needs", []),
+        "pressing_needs":            pressing_needs,
         "image_urls":                image_urls,
         "ai_damage_classification":  combined.get("final_damage_level"),
         "ai_confidence_score":       combined.get("confidence"),
@@ -584,18 +546,13 @@ def submit_report():
     sb_insert("reports", record)
 
     if vg_id and is_dup and body.get("building_footprint_id"):
-        sb_update(
-            "reports",
-            {"building_footprint_id": body.get("building_footprint_id")},
-            {"version_group_id": vg_id},
-        )
+        sb_update("reports", {"building_footprint_id": body.get("building_footprint_id")}, {"version_group_id": vg_id})
 
-    # Return AI-filled fields to Flutter so user can see and optionally correct
     return cors_response(json.dumps({
-        "submission_id":          report_id,
-        "image_urls":             image_urls,
-        "is_duplicate_flagged":   is_dup,
-        "area_signals":           area_signals,
+        "submission_id":         report_id,
+        "image_urls":            image_urls,
+        "is_duplicate_flagged":  is_dup,
+        "area_signals":          area_signals,
         "ai_filled": {
             "damage_level":           image_analysis.get("damage_level"),
             "infrastructure_type":    image_analysis.get("infrastructure_type"),
@@ -610,62 +567,44 @@ def submit_report():
             "reasoning":              image_analysis.get("reasoning"),
         },
         "combined_assessment": {
-            "final_damage_level":    combined.get("final_damage_level"),
-            "priority_score":        combined.get("priority_score"),
-            "recommended_action":    combined.get("recommended_action"),
-            "reasoning":             combined.get("reasoning"),
+            "final_damage_level":  combined.get("final_damage_level"),
+            "priority_score":      combined.get("priority_score"),
+            "recommended_action":  combined.get("recommended_action"),
+            "reasoning":           combined.get("reasoning"),
         },
     }), 201)
 
 
-@app.route("/api/confirm-report", methods=["PATCH", "OPTIONS"])
+@app.route("/api/confirm-report", methods=["GET", "POST", "PATCH", "OPTIONS"])
 def confirm_report():
-    """
-    PATCH /api/confirm-report
-
-    Optional. Called if user wants to correct any AI-filled field.
-    Flutter shows AI result, user taps CONFIRM or corrects one field and confirms.
-
-    Body:
-      - submission_id   (required)
-      - corrections     (dict of any fields to override, optional)
-    """
     if request.method == "OPTIONS":
         return options_response()
 
-    body = request.get_json(silent=True)
+    body = get_body()
     if not body or not body.get("submission_id"):
         return cors_response(json.dumps({"error": "submission_id required"}), 400)
 
     update_data = {"user_confirmed": True}
-
-    allowed_corrections = [
+    allowed = [
         "damage_level", "infrastructure_type", "infrastructure_name",
         "crisis_type", "has_debris", "electricity_status",
         "health_services_status", "pressing_needs", "location_description",
     ]
     corrections = body.get("corrections", {})
-    for field in allowed_corrections:
+    for field in allowed:
         if field in corrections:
             update_data[field] = corrections[field]
 
     sb_update("reports", {"id": body["submission_id"]}, update_data)
-
     return cors_response(json.dumps({"status": "confirmed", "submission_id": body["submission_id"]}), 200)
 
 
-@app.route("/api/reports", methods=["GET", "OPTIONS"])
+@app.route("/api/reports", methods=["GET", "POST", "OPTIONS"])
 def get_reports():
-    """
-    GET /api/reports
-    Query params: crisis_type, damage_level, infrastructure_type,
-                  date_from, date_to, bbox (minlng,minlat,maxlng,maxlat),
-                  format (geojson|csv)
-    """
     if request.method == "OPTIONS":
         return options_response()
 
-    p = request.args
+    p = request.args if request.method == "GET" else (request.get_json(silent=True) or request.args)
     filters = []
 
     if p.get("crisis_type"):
@@ -705,7 +644,7 @@ def get_reports():
     return cors_response(json.dumps(_rows_to_geojson(rows)))
 
 
-@app.route("/api/dashboard-stats", methods=["GET", "OPTIONS"])
+@app.route("/api/dashboard-stats", methods=["GET", "POST", "OPTIONS"])
 def dashboard_stats():
     if request.method == "OPTIONS":
         return options_response()
@@ -736,8 +675,7 @@ def dashboard_stats():
     intensity_map = {"minimal": 0.3, "partial": 0.6, "complete": 1.0}
     heatmap = [
         [float(r["lat"]), float(r["lng"]), intensity_map.get(r.get("damage_level", ""), 0.5)]
-        for r in rows
-        if r.get("lat") and r.get("lng")
+        for r in rows if r.get("lat") and r.get("lng")
     ]
 
     priority_rows = sorted(
@@ -771,14 +709,16 @@ def dashboard_stats():
     }))
 
 
-@app.route("/api/export", methods=["POST", "OPTIONS"])
+@app.route("/api/export", methods=["GET", "POST", "OPTIONS"])
 def export_data():
     if request.method == "OPTIONS":
         return options_response()
 
-    body       = request.get_json(silent=True) or {}
+    body       = get_body()
     filters_in = body.get("filters", {})
-    fmt        = body.get("format", "csv")
+    if isinstance(filters_in, str):
+        filters_in = {}
+    fmt = body.get("format", "csv")
 
     filters = []
     if filters_in.get("crisis_type"):
@@ -812,14 +752,14 @@ def export_data():
     return _rows_to_csv_response(rows)
 
 
-@app.route("/api/reporter-alert", methods=["POST", "OPTIONS"])
+@app.route("/api/reporter-alert", methods=["GET", "POST", "OPTIONS"])
 def reporter_alert():
     if request.method == "OPTIONS":
         return options_response()
 
-    body = request.get_json(silent=True)
+    body = get_body()
     if not body:
-        return cors_response(json.dumps({"error": "Invalid JSON"}), 400)
+        return cors_response(json.dumps({"error": "Invalid request"}), 400)
 
     record = {
         "id":                   str(uuid.uuid4()),
@@ -833,10 +773,7 @@ def reporter_alert():
     }
 
     sb_insert("reporter_alerts", record)
-    logging.info(
-        f"Reporter safety alert from {record['anonymous_device_id']} "
-        f"to coordinator {record['coordinator_id']}"
-    )
+    logging.info(f"Reporter safety alert from {record['anonymous_device_id']} to coordinator {record['coordinator_id']}")
 
     return cors_response(json.dumps({"status": "received"}), 201)
 
@@ -850,10 +787,7 @@ def _rows_to_geojson(rows: list) -> dict:
             continue
         features.append({
             "type": "Feature",
-            "geometry": {
-                "type": "Point",
-                "coordinates": [float(r["lng"]), float(r["lat"])],
-            },
+            "geometry": {"type": "Point", "coordinates": [float(r["lng"]), float(r["lat"])]},
             "properties": {
                 "id":                       r.get("id"),
                 "submitted_at":             r.get("submitted_at"),
@@ -907,9 +841,7 @@ def _rows_to_csv_response(rows: list) -> Response:
             return f'"{s}"' if ("," in s or "\n" in s or '"' in s) else s
         lines.append(",".join(_cell(r.get(f)) for f in _CSV_FIELDS))
 
-    # UTF-8 BOM so Excel renders Arabic, Chinese and other non-Latin scripts correctly
     csv_bytes = ("\ufeff" + "\n".join(lines)).encode("utf-8")
-
     return Response(
         csv_bytes,
         status=200,
