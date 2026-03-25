@@ -231,18 +231,18 @@ def _extract_json_from_gemini(response: dict) -> Optional[dict]:
 
 def step1_image_analysis(image_b64_list: List[str]) -> dict:
     empty = {
-        "damage_level": "partial",
+        "damage_level": "minimal",
         "infrastructure_type": "other",
         "infrastructure_name": "",
-        "crisis_type": "unknown",
-        "has_debris": "unknown",
-        "electricity_status": "unknown",
-        "health_services_status": "unknown",
+        "crisis_type": "insignificant",
+        "has_debris": "attention_not_required",
+        "electricity_status": "attention_not_required",
+        "health_services_status": "attention_not_required",
         "pressing_needs": [],
         "location_description": "",
         "debris_detected": False,
         "confidence": 0.0,
-        "reasoning": "No images or API key provided.",
+        "reasoning": "No images provided.",
     }
 
     if not GEMINI_API_KEY or not image_b64_list:
@@ -257,11 +257,11 @@ Return ONLY a valid JSON object, no markdown, no explanation outside the JSON.
   "damage_level": "minimal | partial | complete",
   "infrastructure_type": "residential | commercial | government | utility | transport | community | public | other",
   "infrastructure_name": "name or description of the specific building or infrastructure visible, empty string if unclear",
-  "crisis_type": "earthquake | flood | tsunami | hurricane | wildfire | explosion | chemical | conflict | civil_unrest | unknown",
-  "has_debris": "yes | no | unknown",
+  "crisis_type": "earthquake | flood | tsunami | hurricane | wildfire | explosion | chemical | conflict | civil_unrest | insignificant",
+  "has_debris": "yes | no | attention_not_required",
   "debris_detected": true or false,
-  "electricity_status": "no_damage | minor_damage | moderate_damage | severe_damage | destroyed | unknown",
-  "health_services_status": "fully_functional | partially_functional | largely_disrupted | not_functioning | unknown",
+  "electricity_status": "no_damage | minor_damage | moderate_damage | severe_damage | destroyed | attention_not_required",
+  "health_services_status": "fully_functional | partially_functional | largely_disrupted | not_functioning | attention_not_required",
   "pressing_needs": ["list", "any", "of", "these", "that", "are", "visible", "or", "implied"],
   "location_description": "brief plain language description of what and where based on visible landmarks, street signs, environment",
   "confidence": 0.0 to 1.0,
