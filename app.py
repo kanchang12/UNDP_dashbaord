@@ -756,98 +756,111 @@ def reporter_alert():
         return options_response()
 
     body = get_body()
+    device_id = body.get("anonymous_device_id", "unknown")
+    lat = body.get("lat")
+    lng = body.get("lng")
+    report_id = str(uuid.uuid4())
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Always store the safety alert
-    record = {
-        "id":                  str(uuid.uuid4()),
-        "alert_type":          body.get("alert_type", "REPORTER_SAFETY_ALERT"),
-        "anonymous_device_id": body.get("anonymous_device_id", "unknown"),
-        "coordinator_id":      body.get("coordinator_id", ""),
-        "lat":                 body.get("lat"),
-        "lng":                 body.get("lng"),
-        "accuracy_metres":     body.get("accuracy_metres"),
-        "triggered_at":        body.get("triggered_at") or datetime.now(timezone.utc).isoformat(),
+    # 1. Always store the safety alert in the secondary table
+    alert_record = {
+        "id": str(uuid.uuid4()),
+        "alert_type": body.get("alert_type", "REPORTER_SAFETY_ALERT"),
+        "anonymous_device_id": device_id,
+        "coordinator_id": body.get("coordinator_id", ""),
+        "lat": lat,
+        "lng": lng,
+        "accuracy_metres": body.get("accuracy_metres"),
+        "triggered_at": body.get("triggered_at") or now_iso,
     }
-    sb_insert("reporter_alerts", record)
-    logging.info(f"Reporter safety alert from {record['anonymous_device_id']} to coordinator {record['coordinator_id']}")
+    sb_insert("reporter_alerts", alert_record)
+    logging.info(f"Alert stored for {device_id}")
 
-    # If images attached — run full AI pipeline and save to reports table
+    # 2. Extract and sanitize images
     images_b64 = body.get("images_b64", [])
     if isinstance(images_b64, str):
         images_b64 = [images_b64]
 
-    if images_b64:
-        device_id = body.get("anonymous_device_id", "unknown")
-        lat       = body.get("lat")
-        lng       = body.get("lng")
-        report_id = str(uuid.uuid4())
+    # 3. Initialize default values (In case images are missing or AI fails)
+    image_urls = []
+    image_analysis = {
+        "damage_level": "minimal",
+        "infrastructure_type": "other",
+        "crisis_type": "insignificant",
+        "location_description": "Alert triggered via reporter safety",
+        "pressing_needs": [],
+        "has_debris": "attention_not_required",
+        "electricity_status": "attention_not_required",
+        "health_services_status": "attention_not_required",
+        "infrastructure_name": "Unknown (Alert Only)"
+    }
+    combined = {
+        "final_damage_level": "minimal",
+        "priority_score": 50,
+        "confidence": 0.5,
+        "recommended_action": "Immediate safety alert: Manual verification required.",
+        "reasoning": "Report generated via emergency reporter-alert trigger."
+    }
+    area_score = 0.5
 
-        image_urls = []
+    # 4. Run full AI pipeline ONLY if images exist
+    if images_b64:
+        # Upload images
         for i, b64 in enumerate(images_b64[:4]):
             url = upload_image_to_storage(b64, report_id, i)
-            if url:
-                image_urls.append(url)
+            if url: image_urls.append(url)
 
+        # AI Analysis
         image_analysis = step1_image_analysis(images_b64[:4])
-        area_signals   = step2_area_signals(
-            float(lat) if lat is not None else None,
-            float(lng) if lng is not None else None,
-        )
-        combined      = step3_combined_assessment(image_analysis, area_signals)
-        is_dup, vg_id = step4_duplicate_detection(body.get("building_footprint_id"), device_id, report_id)
-        area_score    = compute_area_signal_score(area_signals, combined)
+        area_signals = step2_area_signals(float(lat) if lat else None, float(lng) if lng else None)
+        combined = step3_combined_assessment(image_analysis, area_signals)
+        area_score = compute_area_signal_score(area_signals, combined)
 
-        pressing_needs = image_analysis.get("pressing_needs", [])
-        if isinstance(pressing_needs, str):
-            pressing_needs = [pressing_needs]
+    # 5. Determine duplication and grouping
+    is_dup, vg_id = step4_duplicate_detection(body.get("building_footprint_id"), device_id, report_id)
 
-        report_record = {
-            "id":                        report_id,
-            "submitted_at":              datetime.now(timezone.utc).isoformat(),
-            "lat":                       float(lat) if lat is not None else None,
-            "lng":                       float(lng) if lng is not None else None,
-            "building_footprint_id":     body.get("building_footprint_id"),
-            "location_description":      image_analysis.get("location_description", ""),
-            "infrastructure_type":       image_analysis.get("infrastructure_type", "other"),
-            "infrastructure_type_other": "",
-            "infrastructure_name":       image_analysis.get("infrastructure_name", ""),
-            "damage_level":              image_analysis.get("damage_level", "minimal"),
-            "crisis_type":               image_analysis.get("crisis_type", "insignificant"),
-            "has_debris":                image_analysis.get("has_debris", "attention_not_required"),
-            "electricity_status":        image_analysis.get("electricity_status", "attention_not_required"),
-            "health_services_status":    image_analysis.get("health_services_status", "attention_not_required"),
-            "pressing_needs":            pressing_needs,
-            "image_urls":                image_urls,
-            "ai_damage_classification":  combined.get("final_damage_level"),
-            "ai_confidence_score":       combined.get("confidence"),
-            "ai_reasoning":              combined.get("reasoning"),
-            "ai_recommended_action":     combined.get("recommended_action"),
-            "ai_priority_score":         combined.get("priority_score"),
-            "area_signal_score":         area_score,
-            "is_duplicate_flagged":      is_dup,
-            "version_group_id":          vg_id,
-            "language_submitted":        body.get("language_submitted", "en"),
-            "anonymous_device_id":       device_id,
-            "user_confirmed":            False,
-        }
+    # 6. FULL REPORT RECORD - This MUST be outside any 'if' to update the map
+    report_record = {
+        "id": report_id,
+        "submitted_at": now_iso,
+        "lat": float(lat) if lat is not None else None,
+        "lng": float(lng) if lng is not None else None,
+        "building_footprint_id": body.get("building_footprint_id"),
+        "location_description": image_analysis.get("location_description", ""),
+        "infrastructure_type": image_analysis.get("infrastructure_type", "other"),
+        "infrastructure_type_other": "",
+        "infrastructure_name": image_analysis.get("infrastructure_name", ""),
+        "damage_level": image_analysis.get("damage_level", "minimal"),
+        "crisis_type": image_analysis.get("crisis_type", "insignificant"),
+        "has_debris": image_analysis.get("has_debris", "attention_not_required"),
+        "electricity_status": image_analysis.get("electricity_status", "attention_not_required"),
+        "health_services_status": image_analysis.get("health_services_status", "attention_not_required"),
+        "pressing_needs": image_analysis.get("pressing_needs", []),
+        "image_urls": image_urls,
+        "ai_damage_classification": combined.get("final_damage_level"),
+        "ai_confidence_score": combined.get("confidence"),
+        "ai_reasoning": combined.get("reasoning"),
+        "ai_recommended_action": combined.get("recommended_action"),
+        "ai_priority_score": combined.get("priority_score"),
+        "area_signal_score": area_score,
+        "is_duplicate_flagged": is_dup,
+        "version_group_id": vg_id,
+        "language_submitted": body.get("language_submitted", "en"),
+        "anonymous_device_id": device_id,
+        "user_confirmed": False,
+    }
 
-        sb_insert("reports", report_record)
-        logging.info(f"Damage report created from reporter-alert: {report_id}")
+    # Final Save to Dashboard Table
+    sb_insert("reports", report_record)
+    logging.info(f"Dashboard updated for report: {report_id}")
 
-        return cors_response(json.dumps({
-            "status":         "received",
-            "report_created": True,
-            "submission_id":  report_id,
-            "ai_filled": {
-                "damage_level":        image_analysis.get("damage_level"),
-                "infrastructure_type": image_analysis.get("infrastructure_type"),
-                "crisis_type":         image_analysis.get("crisis_type"),
-                "confidence":          image_analysis.get("confidence"),
-                "reasoning":           image_analysis.get("reasoning"),
-            },
-        }), 201)
-
-    return cors_response(json.dumps({"status": "received", "report_created": False}), 201)
+    return cors_response(json.dumps({
+        "status": "received",
+        "report_created": True,
+        "submission_id": report_id,
+        "ai_filled": image_analysis,
+        "combined_assessment": combined
+    }), 201)
 
 
 # ── Serialisation ──────────────────────────────────────────────────────────────
