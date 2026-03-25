@@ -1,17 +1,20 @@
 # MIT Licence — CrisisMap, UNDP Crisis Damage Reporting
-# Azure Functions backend. All environment variables must be configured in
-# Application Settings — never hardcoded.
+# Flask backend. Set environment variables in a .env file or your hosting
+# platform's config — never hardcoded.
 #
 # Required env vars:
 #   SUPABASE_URL        — e.g. https://xxxx.supabase.co
-#   SUPABASE_ANON_KEY   — Supabase anon/service_role key
-#   GEMINI_API_KEY      — Google Gemini API key (image analysis + fallback)
-#   OPENAI_API_KEY      — OpenAI API key (combined assessment, Step 3)
+#   SUPABASE_ANON_KEY   — Supabase anon or service_role key
+#   GEMINI_API_KEY      — Google Gemini API key (image analysis + Step 3 fallback)
+#   OPENAI_API_KEY      — OpenAI API key (Step 3 combined assessment, GPT-4o)
+#
+# Run locally:
+#   pip install -r requirements.txt
+#   python app.py
 #
 # Database schema (run once in Supabase SQL editor):
 # See bottom of this file.
 
-import azure.functions as func
 import base64
 import io
 import json
@@ -22,8 +25,11 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 import requests
+from flask import Flask, request, Response
 
-app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+app = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO)
 
 # ── Environment variables ──────────────────────────────────────────────────────
 
@@ -40,7 +46,7 @@ GEMINI_URL = (
 )
 STORAGE_BUCKET = "report-images"
 
-# ── CORS headers ───────────────────────────────────────────────────────────────
+# ── CORS helpers ───────────────────────────────────────────────────────────────
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -48,8 +54,13 @@ CORS_HEADERS = {
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
 }
 
-def cors_response(body: str, status: int = 200, mimetype: str = "application/json") -> func.HttpResponse:
-    return func.HttpResponse(body, status_code=status, mimetype=mimetype, headers=CORS_HEADERS)
+
+def cors_response(body: str, status: int = 200, mimetype: str = "application/json") -> Response:
+    return Response(body, status=status, mimetype=mimetype, headers=CORS_HEADERS)
+
+
+def options_response() -> Response:
+    return Response("", status=204, headers=CORS_HEADERS)
 
 
 # ── Supabase REST helpers ──────────────────────────────────────────────────────
@@ -213,7 +224,6 @@ def step1_image_analysis(image_b64_list: list[str]) -> dict:
         }
     ]
 
-    # Attach up to 4 images as inline data.
     for b64 in image_b64_list[:4]:
         parts.append({
             "inline_data": {
@@ -247,7 +257,6 @@ def step2_area_signals(lat: float | None, lng: float | None) -> dict:
         return {"nearby_count": 0, "avg_damage": None, "dominant_crisis": None}
 
     two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    # Bounding box approximation for the initial DB query.
     lat_delta = 0.0045  # ~500m
     lng_delta = lat_delta / max(math.cos(math.radians(lat)), 0.01)
 
@@ -259,7 +268,6 @@ def step2_area_signals(lat: float | None, lng: float | None) -> dict:
         "limit": "200",
     }) or []
 
-    # Filter precisely by haversine distance.
     nearby = [
         r for r in rows
         if r.get("lat") and r.get("lng")
@@ -406,7 +414,6 @@ def step4_duplicate_detection(
     if not existing:
         return False, None
 
-    # Use existing version group or create one.
     version_group_id = None
     for row in existing:
         if row.get("version_group_id"):
@@ -415,7 +422,6 @@ def step4_duplicate_detection(
     if not version_group_id:
         version_group_id = str(uuid.uuid4())
 
-    # Flag as duplicate if same device submitted within 10 minutes.
     is_flagged = False
     ten_min_ago = datetime.now(timezone.utc) - timedelta(minutes=10)
     for row in existing:
@@ -434,10 +440,6 @@ def step4_duplicate_detection(
 # ── Area signal score ──────────────────────────────────────────────────────────
 
 def compute_area_signal_score(area_signals: dict, combined: dict) -> float:
-    """
-    Derive a 0-1 normalised area urgency score from the area signals
-    and combined AI assessment.
-    """
     score = combined.get("priority_score", 30) / 100
     density_boost = min(area_signals.get("density_per_km2", 0) / 20, 0.3)
     return round(min(score + density_boost, 1.0), 3)
@@ -445,23 +447,21 @@ def compute_area_signal_score(area_signals: dict, combined: dict) -> float:
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
-@app.route(route="submit-report", methods=["POST", "OPTIONS"])
-def submit_report(req: func.HttpRequest) -> func.HttpResponse:
+@app.route("/api/submit-report", methods=["POST", "OPTIONS"])
+def submit_report():
     """
     POST /api/submit-report
     Accepts: form data (all UNDP fields) + optional base64 images
     Returns: submission_id, ai_classification, priority_score
     """
-    if req.method == "OPTIONS":
-        return cors_response("", 204)
+    if request.method == "OPTIONS":
+        return options_response()
 
     logging.info("submit-report called")
-    try:
-        body = req.get_json()
-    except Exception:
+    body = request.get_json(silent=True)
+    if not body:
         return cors_response(json.dumps({"error": "Invalid JSON"}), 400)
 
-    # ── Validate required fields ───────────────────────────────────────────────
     required = ["infrastructure_type", "damage_level", "crisis_type",
                 "has_debris", "electricity_status", "health_services_status",
                 "pressing_needs", "anonymous_device_id"]
@@ -477,7 +477,6 @@ def submit_report(req: func.HttpRequest) -> func.HttpResponse:
     lng = body.get("lng")
     device_id = body.get("anonymous_device_id", "")
 
-    # ── Upload images to Supabase Storage ──────────────────────────────────────
     images_b64: list[str] = body.get("images_b64", [])
     image_urls: list[str] = []
     for i, b64 in enumerate(images_b64[:4]):
@@ -485,11 +484,9 @@ def submit_report(req: func.HttpRequest) -> func.HttpResponse:
         if url:
             image_urls.append(url)
 
-    # If client sent pre-uploaded URLs, use those.
     if not image_urls:
         image_urls = body.get("image_urls", [])
 
-    # ── AI Pipeline ────────────────────────────────────────────────────────────
     image_analysis = step1_image_analysis(images_b64[:4] if images_b64 else [])
     area_signals   = step2_area_signals(
         float(lat) if lat is not None else None,
@@ -501,7 +498,6 @@ def submit_report(req: func.HttpRequest) -> func.HttpResponse:
     )
     area_score     = compute_area_signal_score(area_signals, combined)
 
-    # ── Persist to Supabase ────────────────────────────────────────────────────
     pressing_needs = body.get("pressing_needs", [])
     if isinstance(pressing_needs, str):
         pressing_needs = [pressing_needs]
@@ -535,9 +531,8 @@ def submit_report(req: func.HttpRequest) -> func.HttpResponse:
         "anonymous_device_id": device_id,
     }
 
-    inserted = sb_insert("reports", record)
+    sb_insert("reports", record)
 
-    # If this report is part of a version group, update older entries with the group id.
     if vg_id and not is_dup:
         sb_update(
             "reports",
@@ -557,8 +552,8 @@ def submit_report(req: func.HttpRequest) -> func.HttpResponse:
     }), 201)
 
 
-@app.route(route="reports", methods=["GET", "OPTIONS"])
-def get_reports(req: func.HttpRequest) -> func.HttpResponse:
+@app.route("/api/reports", methods=["GET", "OPTIONS"])
+def get_reports():
     """
     GET /api/reports
     Returns all reports as GeoJSON with optional filters.
@@ -566,11 +561,11 @@ def get_reports(req: func.HttpRequest) -> func.HttpResponse:
                   date_from, date_to, bbox (minlng,minlat,maxlng,maxlat),
                   format (geojson|csv)
     """
-    if req.method == "OPTIONS":
-        return cors_response("", 204)
+    if request.method == "OPTIONS":
+        return options_response()
 
+    p = request.args
     params: dict = {}
-    p = req.params
 
     if p.get("crisis_type"):
         params["crisis_type"] = f"eq.{p['crisis_type']}"
@@ -588,8 +583,6 @@ def get_reports(req: func.HttpRequest) -> func.HttpResponse:
 
     rows = sb_select("reports", params=params) or []
 
-    # Bounding box filter applied in Python (PostgREST range filters are not
-    # trivially composable for lat/lng pairs).
     bbox = p.get("bbox")
     if bbox:
         try:
@@ -607,29 +600,25 @@ def get_reports(req: func.HttpRequest) -> func.HttpResponse:
     if fmt == "csv":
         return _rows_to_csv_response(rows)
 
-    geojson = _rows_to_geojson(rows)
-    return cors_response(json.dumps(geojson))
+    return cors_response(json.dumps(_rows_to_geojson(rows)))
 
 
-@app.route(route="dashboard-stats", methods=["GET", "OPTIONS"])
-def dashboard_stats(req: func.HttpRequest) -> func.HttpResponse:
+@app.route("/api/dashboard-stats", methods=["GET", "OPTIONS"])
+def dashboard_stats():
     """
     GET /api/dashboard-stats
     Returns aggregate statistics for the dashboard analytics panel.
     """
-    if req.method == "OPTIONS":
-        return cors_response("", 204)
+    if request.method == "OPTIONS":
+        return options_response()
 
     rows = sb_select("reports", params={"order": "submitted_at.desc", "limit": "5000"}) or []
 
     total = len(rows)
-
-    # Breakdown counts
     damage_counts = _count_by(rows, "damage_level")
     infra_counts  = _count_by(rows, "infrastructure_type")
     crisis_counts = _count_by(rows, "crisis_type")
 
-    # Timeline: last 24hrs in 1-hour buckets
     now = datetime.now(timezone.utc)
     buckets: dict[str, int] = {}
     for h in range(24):
@@ -646,7 +635,6 @@ def dashboard_stats(req: func.HttpRequest) -> func.HttpResponse:
         except Exception:
             pass
 
-    # Heatmap points: [lat, lng, intensity] — intensity mapped from damage level
     intensity_map = {"minimal": 0.3, "partial": 0.6, "complete": 1.0}
     heatmap = [
         [float(r["lat"]), float(r["lng"]), intensity_map.get(r.get("damage_level", ""), 0.5)]
@@ -654,7 +642,6 @@ def dashboard_stats(req: func.HttpRequest) -> func.HttpResponse:
         if r.get("lat") and r.get("lng")
     ]
 
-    # Priority queue: top 10 by AI priority score
     priority_rows = sorted(
         [r for r in rows if r.get("ai_priority_score") is not None],
         key=lambda r: float(r["ai_priority_score"]),
@@ -686,21 +673,17 @@ def dashboard_stats(req: func.HttpRequest) -> func.HttpResponse:
     }))
 
 
-@app.route(route="export", methods=["POST", "OPTIONS"])
-def export_data(req: func.HttpRequest) -> func.HttpResponse:
+@app.route("/api/export", methods=["POST", "OPTIONS"])
+def export_data():
     """
     POST /api/export
     Body: { filters: {...}, format: "csv"|"geojson" }
     Returns filtered data as downloadable CSV or GeoJSON.
     """
-    if req.method == "OPTIONS":
-        return cors_response("", 204)
+    if request.method == "OPTIONS":
+        return options_response()
 
-    try:
-        body = req.get_json()
-    except Exception:
-        body = {}
-
+    body = request.get_json(silent=True) or {}
     filters = body.get("filters", {})
     fmt = body.get("format", "csv")
 
@@ -719,34 +702,32 @@ def export_data(req: func.HttpRequest) -> func.HttpResponse:
     rows = sb_select("reports", params=params) or []
 
     if fmt == "geojson":
-        content = json.dumps(_rows_to_geojson(rows), indent=2)
-        return func.HttpResponse(
-            content,
-            status_code=200,
+        resp = Response(
+            json.dumps(_rows_to_geojson(rows), indent=2),
+            status=200,
             mimetype="application/geo+json",
             headers={
                 **CORS_HEADERS,
                 "Content-Disposition": "attachment; filename=crisismap_export.geojson",
             },
         )
+        return resp
 
     return _rows_to_csv_response(rows)
 
 
-@app.route(route="reporter-alert", methods=["POST", "OPTIONS"])
-def reporter_alert(req: func.HttpRequest) -> func.HttpResponse:
+@app.route("/api/reporter-alert", methods=["POST", "OPTIONS"])
+def reporter_alert():
     """
     POST /api/reporter-alert
     Receives a silent reporter safety alert from the Flutter app.
-    Stores to a dedicated 'reporter_alerts' table for the assigned coordinator.
-    No PII is stored — only anonymous_device_id, GPS, and timestamp.
+    No PII — only anonymous_device_id, GPS, and timestamp.
     """
-    if req.method == "OPTIONS":
-        return cors_response("", 204)
+    if request.method == "OPTIONS":
+        return options_response()
 
-    try:
-        body = req.get_json()
-    except Exception:
+    body = request.get_json(silent=True)
+    if not body:
         return cors_response(json.dumps({"error": "Invalid JSON"}), 400)
 
     record = {
@@ -769,7 +750,6 @@ def reporter_alert(req: func.HttpRequest) -> func.HttpResponse:
 # ── Serialisation helpers ──────────────────────────────────────────────────────
 
 def _rows_to_geojson(rows: list) -> dict:
-    """Convert report rows to valid GeoJSON FeatureCollection."""
     features = []
     for r in rows:
         if not r.get("lat") or not r.get("lng"):
@@ -820,7 +800,7 @@ _CSV_FIELDS = [
 ]
 
 
-def _rows_to_csv_response(rows: list) -> func.HttpResponse:
+def _rows_to_csv_response(rows: list) -> Response:
     lines = [",".join(_CSV_FIELDS)]
     for r in rows:
         def _cell(v):
@@ -830,12 +810,11 @@ def _rows_to_csv_response(rows: list) -> func.HttpResponse:
                 return ""
             s = str(v).replace('"', '""')
             return f'"{s}"' if ("," in s or "\n" in s or '"' in s) else s
-
         lines.append(",".join(_cell(r.get(f)) for f in _CSV_FIELDS))
 
-    return func.HttpResponse(
+    return Response(
         "\n".join(lines),
-        status_code=200,
+        status=200,
         mimetype="text/csv",
         headers={
             **CORS_HEADERS,
@@ -901,13 +880,13 @@ def _count_by(rows: list, field: str) -> dict:
 #   triggered_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 # );
 #
-# -- Index for bounding box and time queries
+# -- Indexes
 # CREATE INDEX IF NOT EXISTS idx_reports_lat_lng ON reports (lat, lng);
 # CREATE INDEX IF NOT EXISTS idx_reports_submitted ON reports (submitted_at DESC);
 # CREATE INDEX IF NOT EXISTS idx_reports_damage ON reports (damage_level);
 # CREATE INDEX IF NOT EXISTS idx_reports_building ON reports (building_footprint_id);
 #
-# -- Enable Row Level Security and allow anonymous read/insert
+# -- Row Level Security
 # ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
 # CREATE POLICY "anon_insert" ON reports FOR INSERT TO anon WITH CHECK (true);
 # CREATE POLICY "anon_select" ON reports FOR SELECT TO anon USING (true);
@@ -915,7 +894,7 @@ def _count_by(rows: list, field: str) -> dict:
 # ALTER TABLE reporter_alerts ENABLE ROW LEVEL SECURITY;
 # CREATE POLICY "anon_insert_alerts" ON reporter_alerts FOR INSERT TO anon WITH CHECK (true);
 #
-# -- Create Storage bucket for report images
+# -- Storage bucket for report images
 # INSERT INTO storage.buckets (id, name, public)
 #   VALUES ('report-images', 'report-images', true)
 #   ON CONFLICT DO NOTHING;
@@ -925,3 +904,7 @@ def _count_by(rows: list, field: str) -> dict:
 # CREATE POLICY "public_read" ON storage.objects FOR SELECT TO anon
 #   USING (bucket_id = 'report-images');
 # ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
