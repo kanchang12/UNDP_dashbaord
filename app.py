@@ -1,16 +1,16 @@
 # MIT Licence — CrisisMap, UNDP Crisis Damage Reporting
-# Flask backend. Set environment variables in a .env file or your hosting
-# platform's config — never hardcoded.
+# Flask backend.
 #
 # Required env vars:
 #   SUPABASE_URL        — e.g. https://xxxx.supabase.co
 #   SUPABASE_ANON_KEY   — Supabase anon or service_role key
-#   GEMINI_API_KEY      — Google Gemini API key (image analysis + Step 3 fallback)
-#   OPENAI_API_KEY      — OpenAI API key (Step 3 combined assessment, GPT-4o)
+#   GEMINI_API_KEY      — Google Gemini API key
+#   OPENAI_API_KEY      — OpenAI API key (optional, GPT-4o fallback)
 #
-# Run locally:
-#   pip install -r requirements.txt
-#   python app.py
+# Submit flow:
+#   Flutter sends: anonymous_device_id + lat + lng + up to 4 base64 images
+#   Backend reads images with Gemini Vision and fills ALL UNDP fields automatically
+#   No form filling required from the user
 
 import base64
 import json
@@ -25,7 +25,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import requests
 from flask import Flask, request, Response, render_template
 
-# FIX 1 — explicit template and static folders so render_template works
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
 logging.basicConfig(level=logging.INFO)
@@ -44,17 +43,16 @@ GEMINI_URL = (
 )
 STORAGE_BUCKET = "report-images"
 
-# FIX 7 — simple in-memory rate limit store (device_id -> list of timestamps)
+# Rate limiting
 _rate_limit_store: Dict[str, List[datetime]] = defaultdict(list)
-RATE_LIMIT_MAX    = 10   # max submissions
-RATE_LIMIT_WINDOW = 60   # per N seconds
+RATE_LIMIT_MAX    = 10
+RATE_LIMIT_WINDOW = 60
 
-
-# ── CORS helpers ───────────────────────────────────────────────────────────────
+# ── CORS ───────────────────────────────────────────────────────────────────────
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
 }
 
@@ -68,7 +66,6 @@ def options_response() -> Response:
 
 
 def is_rate_limited(device_id: str) -> bool:
-    """FIX 7 — reject if device submits more than RATE_LIMIT_MAX times in RATE_LIMIT_WINDOW seconds."""
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(seconds=RATE_LIMIT_WINDOW)
     timestamps = _rate_limit_store[device_id]
@@ -79,14 +76,14 @@ def is_rate_limited(device_id: str) -> bool:
     return False
 
 
-# ── Root route — serves dashboard ─────────────────────────────────────────────
+# ── Root ───────────────────────────────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
 def index():
     return render_template("index.html")
 
 
-# ── Supabase REST helpers ──────────────────────────────────────────────────────
+# ── Supabase helpers ───────────────────────────────────────────────────────────
 
 def _sb_headers(content_type: str = "application/json") -> dict:
     return {
@@ -143,10 +140,9 @@ def sb_update(table: str, match: dict, data: dict) -> None:
         logging.error(f"sb_update {table}: {e}")
 
 
-# ── Supabase Storage ───────────────────────────────────────────────────────────
+# ── Storage ────────────────────────────────────────────────────────────────────
 
 def _detect_mime(image_b64: str) -> str:
-    """FIX 5 — detect actual image mime type from magic bytes, not assume JPEG."""
     try:
         header = base64.b64decode(image_b64[:16])
         if header[:8] == b'\x89PNG\r\n\x1a\n':
@@ -189,7 +185,7 @@ def upload_image_to_storage(image_b64: str, report_id: str, index: int) -> Optio
         return None
 
 
-# ── Haversine distance (metres) ────────────────────────────────────────────────
+# ── Haversine ──────────────────────────────────────────────────────────────────
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     R = 6_371_000
@@ -200,9 +196,9 @@ def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-# ── AI Pipeline ────────────────────────────────────────────────────────────────
+# ── Gemini helpers ─────────────────────────────────────────────────────────────
 
-def _gemini_post(payload: dict, timeout: int = 20) -> Optional[dict]:
+def _gemini_post(payload: dict, timeout: int = 30) -> Optional[dict]:
     try:
         r = requests.post(
             GEMINI_URL,
@@ -229,38 +225,61 @@ def _extract_json_from_gemini(response: dict) -> Optional[dict]:
     return None
 
 
+# ── STEP 1 — AI reads images and fills ALL UNDP fields ────────────────────────
+
 def step1_image_analysis(image_b64_list: List[str]) -> dict:
     """
-    Step 1 — Gemini Vision API.
-    Analyses all submitted images together and returns a structured damage assessment.
+    Gemini Vision reads up to 4 images and fills every UNDP required field.
+    The user sends only photos + GPS. This function does the form filling.
     """
+    empty = {
+        "damage_level": "partial",
+        "infrastructure_type": "other",
+        "infrastructure_name": "",
+        "crisis_type": "unknown",
+        "has_debris": "unknown",
+        "electricity_status": "unknown",
+        "health_services_status": "unknown",
+        "pressing_needs": [],
+        "location_description": "",
+        "debris_detected": False,
+        "confidence": 0.0,
+        "reasoning": "No images or API key provided.",
+    }
+
     if not GEMINI_API_KEY or not image_b64_list:
-        return {
-            "damage_level": "unknown",
-            "infrastructure_type": "unknown",
-            "debris_detected": False,
-            "confidence": 0.0,
-            "reasoning": "Image analysis unavailable — no API key or images.",
-        }
+        return empty
 
-    parts = [
-        {
-            "text": (
-                "Analyse these images of infrastructure damage. "
-                "Classify damage as exactly one of: minimal, partial, or complete. "
-                "Identify the infrastructure type visible. "
-                "Detect any debris present. "
-                "Provide a confidence score 0-1. "
-                "Return JSON only, no markdown: "
-                '{"damage_level": "minimal|partial|complete", '
-                '"infrastructure_type": "residential|commercial|government|utility|transport|community|public|other", '
-                '"debris_detected": true|false, '
-                '"confidence": 0.0-1.0, '
-                '"reasoning": "one sentence"}'
-            )
-        }
-    ]
+    prompt = """
+You are a UNDP crisis damage assessment AI. Analyse all provided images carefully.
+Fill in EVERY field below based strictly on what you can see in the images.
+Return ONLY a valid JSON object, no markdown, no explanation outside the JSON.
 
+{
+  "damage_level": "minimal | partial | complete",
+  "infrastructure_type": "residential | commercial | government | utility | transport | community | public | other",
+  "infrastructure_name": "name or description of the specific building or infrastructure visible, empty string if unclear",
+  "crisis_type": "earthquake | flood | tsunami | hurricane | wildfire | explosion | chemical | conflict | civil_unrest | unknown",
+  "has_debris": "yes | no | unknown",
+  "debris_detected": true or false,
+  "electricity_status": "no_damage | minor_damage | moderate_damage | severe_damage | destroyed | unknown",
+  "health_services_status": "fully_functional | partially_functional | largely_disrupted | not_functioning | unknown",
+  "pressing_needs": ["list", "any", "of", "these", "that", "are", "visible", "or", "implied"],
+  "location_description": "brief plain language description of what and where based on visible landmarks, street signs, environment",
+  "confidence": 0.0 to 1.0,
+  "reasoning": "one sentence explaining your damage assessment"
+}
+
+For pressing_needs, pick only from this exact list based on what the images imply:
+food_water, cash_assistance, healthcare, shelter, livelihoods, wash, infrastructure_restoration, psychosocial_support, authority_support, other
+
+Damage level definitions:
+- minimal: structurally sound, cosmetic damage only
+- partial: repairable, usable with caution  
+- complete: structurally unsafe or destroyed
+"""
+
+    parts = [{"text": prompt}]
     for b64 in image_b64_list[:4]:
         mime = _detect_mime(b64)
         parts.append({
@@ -271,34 +290,32 @@ def step1_image_analysis(image_b64_list: List[str]) -> dict:
         })
 
     payload = {"contents": [{"parts": parts}]}
-    response = _gemini_post(payload, timeout=30)
+    response = _gemini_post(payload, timeout=45)
+
     if response:
         result = _extract_json_from_gemini(response)
         if result:
+            # Ensure pressing_needs is always a list
+            if isinstance(result.get("pressing_needs"), str):
+                result["pressing_needs"] = [result["pressing_needs"]]
+            if not isinstance(result.get("pressing_needs"), list):
+                result["pressing_needs"] = []
             return result
 
-    return {
-        "damage_level": "unknown",
-        "infrastructure_type": "unknown",
-        "debris_detected": False,
-        "confidence": 0.0,
-        "reasoning": "Gemini Vision analysis returned no parseable result.",
-    }
+    logging.warning("Gemini image analysis returned no parseable result — using defaults")
+    return {**empty, "reasoning": "AI could not analyse images — defaults applied."}
 
+
+# ── STEP 2 — Area signals ──────────────────────────────────────────────────────
 
 def step2_area_signals(lat: Optional[float], lng: Optional[float]) -> dict:
-    """
-    Step 2 — Area signal aggregation.
-    FIX 4 — queries BOTH sides of the bounding box (min AND max lat/lng).
-    """
     if lat is None or lng is None:
         return {"nearby_count": 0, "avg_damage": None, "dominant_crisis": None, "density_per_km2": 0}
 
     two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    lat_delta = 0.0045  # ~500m
+    lat_delta = 0.0045
     lng_delta = lat_delta / max(math.cos(math.radians(lat)), 0.01)
 
-    # FIX 4 — use PostgREST and() to apply both gte and lte on same columns
     rows = sb_select("reports", params={
         "and": (
             f"(lat.gte.{lat - lat_delta},"
@@ -345,39 +362,29 @@ def step2_area_signals(lat: Optional[float], lng: Optional[float]) -> dict:
     }
 
 
+# ── STEP 3 — Combined assessment ───────────────────────────────────────────────
+
 def step3_combined_assessment(
     image_analysis: dict,
     area_signals: dict,
-    form_data: dict,
 ) -> dict:
-    """
-    Step 3 — Combined AI decision.
-    Sends image analysis + area signals + form data to OpenAI GPT-4o,
-    with Gemini as fallback.
-    """
     system_prompt = (
         "You are a UNDP crisis assessment AI. "
-        "Given image analysis results and surrounding area signals, "
-        "make a final damage assessment and priority score for emergency responders. "
-        "Be objective and data-driven. Return JSON only, no markdown."
+        "Given image analysis and surrounding area signals, "
+        "produce a final priority score and recommended action for emergency responders. "
+        "Return JSON only, no markdown."
     )
     user_content = (
         f"Image analysis: {json.dumps(image_analysis)}\n"
-        f"Area signals (500m radius, last 2h): {json.dumps(area_signals)}\n"
-        f"Reported infrastructure type: {form_data.get('infrastructure_type', 'unknown')}\n"
-        f"Reported damage level: {form_data.get('damage_level', 'unknown')}\n"
-        f"Crisis type: {form_data.get('crisis_type', 'unknown')}\n"
-        f"Debris reported: {form_data.get('has_debris', 'unknown')}\n"
-        f"Pressing needs: {form_data.get('pressing_needs', [])}\n\n"
+        f"Area signals (500m radius, last 2h): {json.dumps(area_signals)}\n\n"
         "Return JSON: "
         '{"final_damage_level": "minimal|partial|complete", '
         '"priority_score": 0-100, '
         '"confidence": 0.0-1.0, '
-        '"recommended_action": "one sentence action for responders", '
+        '"recommended_action": "one sentence for responders", '
         '"reasoning": "two sentences max"}'
     )
 
-    # OpenAI GPT-4o (primary)
     if OPENAI_API_KEY:
         try:
             r = requests.post(
@@ -405,7 +412,6 @@ def step3_combined_assessment(
         except Exception as e:
             logging.warning(f"OpenAI step3 failed, falling back to Gemini: {e}")
 
-    # Gemini fallback
     payload = {
         "contents": [{
             "parts": [{"text": f"System: {system_prompt}\n\nUser: {user_content}"}]
@@ -417,33 +423,24 @@ def step3_combined_assessment(
         if result:
             return result
 
-    # Hard fallback — use reported data + image analysis
-    reported = form_data.get("damage_level", "unknown")
-    ai_damage = image_analysis.get("damage_level", reported)
-    final = ai_damage if ai_damage != "unknown" else reported
+    final = image_analysis.get("damage_level", "partial")
     priority = {"minimal": 20, "partial": 55, "complete": 85}.get(final, 30)
-
     return {
         "final_damage_level": final,
         "priority_score": priority,
         "confidence": image_analysis.get("confidence", 0.3),
         "recommended_action": "Dispatch assessment team to verify damage.",
-        "reasoning": "Automated assessment unavailable; using reported values.",
+        "reasoning": "Automated combined assessment unavailable; using image analysis values.",
     }
 
+
+# ── STEP 4 — Duplicate detection ───────────────────────────────────────────────
 
 def step4_duplicate_detection(
     building_footprint_id: Optional[str],
     device_id: str,
     report_id: str,
 ) -> Tuple[bool, Optional[str]]:
-    """
-    Step 4 — Duplicate detection.
-    FIX 3 — guard against None building_footprint_id corrupting all records.
-    FIX 8 — version_group_id is assigned when a duplicate IS found, not when it is not.
-    Returns (is_duplicate_flagged, version_group_id).
-    """
-    # FIX 3 — never query or update with an empty building_footprint_id
     if not building_footprint_id:
         return False, None
 
@@ -458,7 +455,6 @@ def step4_duplicate_detection(
     if not existing:
         return False, None
 
-    # FIX 8 — version group only assigned when existing reports found for same building
     version_group_id = None
     for row in existing:
         if row.get("version_group_id"):
@@ -482,56 +478,53 @@ def step4_duplicate_detection(
     return is_flagged, version_group_id
 
 
-# ── Area signal score ──────────────────────────────────────────────────────────
-
 def compute_area_signal_score(area_signals: dict, combined: dict) -> float:
     score = combined.get("priority_score", 30) / 100
     density_boost = min(area_signals.get("density_per_km2", 0) / 20, 0.3)
     return round(min(score + density_boost, 1.0), 3)
 
 
-# ── Endpoints ──────────────────────────────────────────────────────────────────
+# ── ENDPOINTS ──────────────────────────────────────────────────────────────────
 
 @app.route("/api/submit-report", methods=["POST", "OPTIONS"])
 def submit_report():
     """
     POST /api/submit-report
-    Accepts: form data (all UNDP fields) + optional base64 images
-    Returns: submission_id, ai_classification, priority_score
+
+    Flutter sends ONLY:
+      - anonymous_device_id  (required)
+      - lat                  (optional but preferred)
+      - lng                  (optional but preferred)
+      - images_b64           (list of up to 4 base64 images)
+      - language_submitted   (optional, default 'en')
+      - building_footprint_id (optional)
+
+    Gemini reads the images and fills ALL UNDP fields automatically.
+    Returns the AI-filled form data so Flutter can display it to the user.
+    User can then optionally correct via PATCH /api/confirm-report.
     """
     if request.method == "OPTIONS":
         return options_response()
 
-    logging.info("submit-report called")
     body = request.get_json(silent=True)
     if not body:
         return cors_response(json.dumps({"error": "Invalid JSON"}), 400)
 
-    # FIX 7 — rate limit check before any processing
     device_id = body.get("anonymous_device_id", "")
     if not device_id:
         return cors_response(json.dumps({"error": "anonymous_device_id required"}), 400)
+
     if is_rate_limited(device_id):
         return cors_response(
             json.dumps({"error": "Rate limit exceeded. Please wait before submitting again."}), 429
         )
 
-    required = [
-        "infrastructure_type", "damage_level", "crisis_type",
-        "has_debris", "electricity_status", "health_services_status",
-        "pressing_needs", "anonymous_device_id",
-    ]
-    missing = [f for f in required if not body.get(f)]
-    if missing:
-        return cors_response(
-            json.dumps({"error": f"Missing required fields: {missing}"}), 400
-        )
-
     report_id    = str(uuid.uuid4())
-    submitted_at = body.get("submitted_at") or datetime.now(timezone.utc).isoformat()
+    submitted_at = datetime.now(timezone.utc).isoformat()
     lat          = body.get("lat")
     lng          = body.get("lng")
 
+    # Upload images to storage first
     images_b64: List[str] = body.get("images_b64", [])
     image_urls: List[str] = []
     for i, b64 in enumerate(images_b64[:4]):
@@ -539,23 +532,24 @@ def submit_report():
         if url:
             image_urls.append(url)
 
-    if not image_urls:
-        image_urls = body.get("image_urls", [])
-
+    # Step 1 — AI reads images and fills every UNDP field
     image_analysis = step1_image_analysis(images_b64[:4] if images_b64 else [])
-    area_signals   = step2_area_signals(
+
+    # Step 2 — area signals from nearby reports
+    area_signals = step2_area_signals(
         float(lat) if lat is not None else None,
         float(lng) if lng is not None else None,
     )
-    combined       = step3_combined_assessment(image_analysis, area_signals, body)
-    is_dup, vg_id  = step4_duplicate_detection(
+
+    # Step 3 — combined priority assessment
+    combined = step3_combined_assessment(image_analysis, area_signals)
+
+    # Step 4 — duplicate detection
+    is_dup, vg_id = step4_duplicate_detection(
         body.get("building_footprint_id"), device_id, report_id
     )
-    area_score     = compute_area_signal_score(area_signals, combined)
 
-    pressing_needs = body.get("pressing_needs", [])
-    if isinstance(pressing_needs, str):
-        pressing_needs = [pressing_needs]
+    area_score = compute_area_signal_score(area_signals, combined)
 
     record = {
         "id":                        report_id,
@@ -563,16 +557,16 @@ def submit_report():
         "lat":                       float(lat) if lat is not None else None,
         "lng":                       float(lng) if lng is not None else None,
         "building_footprint_id":     body.get("building_footprint_id"),
-        "location_description":      body.get("location_description"),
-        "infrastructure_type":       body.get("infrastructure_type"),
-        "infrastructure_type_other": body.get("infrastructure_type_other"),
-        "infrastructure_name":       body.get("infrastructure_name"),
-        "damage_level":              body.get("damage_level"),
-        "crisis_type":               body.get("crisis_type"),
-        "has_debris":                body.get("has_debris"),
-        "electricity_status":        body.get("electricity_status"),
-        "health_services_status":    body.get("health_services_status"),
-        "pressing_needs":            pressing_needs,
+        "location_description":      image_analysis.get("location_description", ""),
+        "infrastructure_type":       image_analysis.get("infrastructure_type", "other"),
+        "infrastructure_type_other": "",
+        "infrastructure_name":       image_analysis.get("infrastructure_name", ""),
+        "damage_level":              image_analysis.get("damage_level", "partial"),
+        "crisis_type":               image_analysis.get("crisis_type", "unknown"),
+        "has_debris":                image_analysis.get("has_debris", "unknown"),
+        "electricity_status":        image_analysis.get("electricity_status", "unknown"),
+        "health_services_status":    image_analysis.get("health_services_status", "unknown"),
+        "pressing_needs":            image_analysis.get("pressing_needs", []),
         "image_urls":                image_urls,
         "ai_damage_classification":  combined.get("final_damage_level"),
         "ai_confidence_score":       combined.get("confidence"),
@@ -584,11 +578,11 @@ def submit_report():
         "version_group_id":          vg_id,
         "language_submitted":        body.get("language_submitted", "en"),
         "anonymous_device_id":       device_id,
+        "user_confirmed":            False,
     }
 
     sb_insert("reports", record)
 
-    # FIX 8 — only propagate version_group when duplicates confirmed AND footprint exists
     if vg_id and is_dup and body.get("building_footprint_id"):
         sb_update(
             "reports",
@@ -596,23 +590,74 @@ def submit_report():
             {"version_group_id": vg_id},
         )
 
+    # Return AI-filled fields to Flutter so user can see and optionally correct
     return cors_response(json.dumps({
-        "submission_id":         report_id,
-        "ai_classification":     combined.get("final_damage_level"),
-        "ai_priority_score":     combined.get("priority_score"),
-        "ai_reasoning":          combined.get("reasoning"),
-        "ai_recommended_action": combined.get("recommended_action"),
-        "area_signals":          area_signals,
-        "is_duplicate_flagged":  is_dup,
-        "image_urls":            image_urls,
+        "submission_id":          report_id,
+        "image_urls":             image_urls,
+        "is_duplicate_flagged":   is_dup,
+        "area_signals":           area_signals,
+        "ai_filled": {
+            "damage_level":           image_analysis.get("damage_level"),
+            "infrastructure_type":    image_analysis.get("infrastructure_type"),
+            "infrastructure_name":    image_analysis.get("infrastructure_name"),
+            "crisis_type":            image_analysis.get("crisis_type"),
+            "has_debris":             image_analysis.get("has_debris"),
+            "electricity_status":     image_analysis.get("electricity_status"),
+            "health_services_status": image_analysis.get("health_services_status"),
+            "pressing_needs":         image_analysis.get("pressing_needs"),
+            "location_description":   image_analysis.get("location_description"),
+            "confidence":             image_analysis.get("confidence"),
+            "reasoning":              image_analysis.get("reasoning"),
+        },
+        "combined_assessment": {
+            "final_damage_level":    combined.get("final_damage_level"),
+            "priority_score":        combined.get("priority_score"),
+            "recommended_action":    combined.get("recommended_action"),
+            "reasoning":             combined.get("reasoning"),
+        },
     }), 201)
+
+
+@app.route("/api/confirm-report", methods=["PATCH", "OPTIONS"])
+def confirm_report():
+    """
+    PATCH /api/confirm-report
+
+    Optional. Called if user wants to correct any AI-filled field.
+    Flutter shows AI result, user taps CONFIRM or corrects one field and confirms.
+
+    Body:
+      - submission_id   (required)
+      - corrections     (dict of any fields to override, optional)
+    """
+    if request.method == "OPTIONS":
+        return options_response()
+
+    body = request.get_json(silent=True)
+    if not body or not body.get("submission_id"):
+        return cors_response(json.dumps({"error": "submission_id required"}), 400)
+
+    update_data = {"user_confirmed": True}
+
+    allowed_corrections = [
+        "damage_level", "infrastructure_type", "infrastructure_name",
+        "crisis_type", "has_debris", "electricity_status",
+        "health_services_status", "pressing_needs", "location_description",
+    ]
+    corrections = body.get("corrections", {})
+    for field in allowed_corrections:
+        if field in corrections:
+            update_data[field] = corrections[field]
+
+    sb_update("reports", {"id": body["submission_id"]}, update_data)
+
+    return cors_response(json.dumps({"status": "confirmed", "submission_id": body["submission_id"]}), 200)
 
 
 @app.route("/api/reports", methods=["GET", "OPTIONS"])
 def get_reports():
     """
     GET /api/reports
-    Returns all reports as GeoJSON with optional filters.
     Query params: crisis_type, damage_level, infrastructure_type,
                   date_from, date_to, bbox (minlng,minlat,maxlng,maxlat),
                   format (geojson|csv)
@@ -629,7 +674,6 @@ def get_reports():
         filters.append(f"damage_level.eq.{p['damage_level']}")
     if p.get("infrastructure_type"):
         filters.append(f"infrastructure_type.eq.{p['infrastructure_type']}")
-    # FIX 1 — both date_from and date_to applied via and(), neither overwrites the other
     if p.get("date_from"):
         filters.append(f"submitted_at.gte.{p['date_from']}")
     if p.get("date_to"):
@@ -663,10 +707,6 @@ def get_reports():
 
 @app.route("/api/dashboard-stats", methods=["GET", "OPTIONS"])
 def dashboard_stats():
-    """
-    GET /api/dashboard-stats
-    Returns aggregate statistics for the dashboard analytics panel.
-    """
     if request.method == "OPTIONS":
         return options_response()
 
@@ -733,11 +773,6 @@ def dashboard_stats():
 
 @app.route("/api/export", methods=["POST", "OPTIONS"])
 def export_data():
-    """
-    POST /api/export
-    Body: { filters: {...}, format: "csv"|"geojson" }
-    Returns filtered data as downloadable CSV or GeoJSON.
-    """
     if request.method == "OPTIONS":
         return options_response()
 
@@ -752,7 +787,6 @@ def export_data():
         filters.append(f"damage_level.eq.{filters_in['damage_level']}")
     if filters_in.get("infrastructure_type"):
         filters.append(f"infrastructure_type.eq.{filters_in['infrastructure_type']}")
-    # FIX 1 — date range applied correctly via and()
     if filters_in.get("date_from"):
         filters.append(f"submitted_at.gte.{filters_in['date_from']}")
     if filters_in.get("date_to"):
@@ -780,11 +814,6 @@ def export_data():
 
 @app.route("/api/reporter-alert", methods=["POST", "OPTIONS"])
 def reporter_alert():
-    """
-    POST /api/reporter-alert
-    Receives a silent reporter safety alert from the Flutter app.
-    No PII — only anonymous_device_id, GPS, and timestamp.
-    """
     if request.method == "OPTIONS":
         return options_response()
 
@@ -812,7 +841,7 @@ def reporter_alert():
     return cors_response(json.dumps({"status": "received"}), 201)
 
 
-# ── Serialisation helpers ──────────────────────────────────────────────────────
+# ── Serialisation ──────────────────────────────────────────────────────────────
 
 def _rows_to_geojson(rows: list) -> dict:
     features = []
@@ -848,6 +877,7 @@ def _rows_to_geojson(rows: list) -> dict:
                 "is_duplicate_flagged":     r.get("is_duplicate_flagged"),
                 "version_group_id":         r.get("version_group_id"),
                 "language_submitted":       r.get("language_submitted"),
+                "user_confirmed":           r.get("user_confirmed"),
             },
         })
     return {"type": "FeatureCollection", "features": features}
@@ -861,7 +891,7 @@ _CSV_FIELDS = [
     "image_urls", "ai_damage_classification", "ai_confidence_score",
     "ai_reasoning", "ai_recommended_action", "ai_priority_score",
     "area_signal_score", "is_duplicate_flagged", "version_group_id",
-    "language_submitted", "anonymous_device_id",
+    "language_submitted", "anonymous_device_id", "user_confirmed",
 ]
 
 
@@ -877,7 +907,7 @@ def _rows_to_csv_response(rows: list) -> Response:
             return f'"{s}"' if ("," in s or "\n" in s or '"' in s) else s
         lines.append(",".join(_cell(r.get(f)) for f in _CSV_FIELDS))
 
-    # FIX 6 — UTF-8 BOM so Excel correctly renders Arabic, Chinese, and other non-Latin scripts
+    # UTF-8 BOM so Excel renders Arabic, Chinese and other non-Latin scripts correctly
     csv_bytes = ("\ufeff" + "\n".join(lines)).encode("utf-8")
 
     return Response(
