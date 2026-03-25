@@ -258,7 +258,7 @@ def step1_image_analysis(image_b64_list: List[str]) -> dict:
         
     try:
         response = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash",
             contents=parts,
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
