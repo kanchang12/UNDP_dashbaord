@@ -470,8 +470,6 @@ def submit_report():
         return options_response()
 
     body = get_body()
-    if not body:
-        return cors_response(json.dumps({"error": "Invalid request"}), 400)
 
     device_id = body.get("anonymous_device_id", "")
     if not device_id:
@@ -758,8 +756,6 @@ def reporter_alert():
         return options_response()
 
     body = get_body()
-    if not body:
-        return cors_response(json.dumps({"error": "Invalid request"}), 400)
 
     record = {
         "id":                   str(uuid.uuid4()),
