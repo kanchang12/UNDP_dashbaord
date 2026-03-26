@@ -86,7 +86,7 @@ def sb_insert(table: str, data: dict) -> Optional[dict]:
 
 def sb_select(table: str, params: Optional[dict] = None, single: bool = False) -> Union[List, Optional[dict]]:
     try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/reporter_alerts", headers={**_sb_headers(), "Accept": "application/json"}, params=params or {}, timeout=10)
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers={**_sb_headers(), "Accept": "application/json"}, params=params or {}, timeout=10)
         r.raise_for_status()
         data = r.json()
         return data[0] if single and data else data
